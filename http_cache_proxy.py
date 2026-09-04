@@ -45,13 +45,26 @@ from mitmproxy import http
 
 logger = logging.getLogger('http_cache_proxy')
 
+# Request headers NOT to pass upstream: hop-by-hop, or ones that describe the
+# connection to the proxy rather than the request being made.  Everything else
+# is forwarded, so the origin sees the request the client actually made.
+# Substituting our own User-Agent and Accept is a way to get different
+# behaviour out of a picky server for no reason -- a caching proxy should
+# replay the request, not paraphrase it.
+SKIPPED_REQUEST_HEADERS = frozenset({
+    'host', 'connection', 'proxy-connection', 'keep-alive', 'te', 'trailer',
+    'transfer-encoding', 'upgrade', 'accept-encoding',
+})
+
 # Response headers worth replaying.  Deliberately not the hop-by-hop ones, and
 # deliberately not Content-Encoding: the stored body is already decoded.
 REPLAYED_HEADERS = ('content-type', 'last-modified', 'etag')
 
 # Long enough for a few hundred MB over a bad link, short enough that a
-# genuinely hung connection does not eat the job's wall clock.
-UPSTREAM_TIMEOUT = 120
+# genuinely hung connection does not eat the job's wall clock.  Raised from
+# 120s after a download-heavy job failed: a large file from a slow origin is
+# ordinary, not a hang.
+UPSTREAM_TIMEOUT = 300
 
 # Retrying belongs here rather than in each client.  The proxy is now the only
 # thing that talks to the origin server, so one retry policy covers every
@@ -196,7 +209,7 @@ class HTTPCache:
 
     # -- upstream --------------------------------------------------------
 
-    def _fetch(self, url):
+    def _fetch(self, url, headers=None):
         """Fetch ``url`` upstream, retrying a transient failure.
 
         A definitive HTTP error is raised at once, so a genuine "not found" is
@@ -205,7 +218,7 @@ class HTTPCache:
         last_exc = None
         for attempt in range(1, UPSTREAM_ATTEMPTS + 1):
             try:
-                return self._fetch_once(url)
+                return self._fetch_once(url, headers)
             except urllib.error.HTTPError as exc:
                 if exc.code in NO_RETRY_STATUS:
                     raise
@@ -220,7 +233,7 @@ class HTTPCache:
                 time.sleep(min(UPSTREAM_BACKOFF_CAP, 2 ** attempt))
         raise last_exc
 
-    def _fetch_once(self, url):
+    def _fetch_once(self, url, headers=None):
         """Fetch ``url`` upstream, following redirects, and verify the length.
 
         The redirect chain is followed here rather than being handed back to
@@ -229,9 +242,12 @@ class HTTPCache:
         expire, so a cached redirect is a replay that fails for no reason once
         its token goes stale.
         """
-        request = urllib.request.Request(
-            url, headers={'User-Agent': 'http-cache-proxy'}
-        )
+        # Accept-Encoding is dropped so the body we store is the decoded one;
+        # everything else the client sent is passed through unchanged.
+        forwarded = {k: v for k, v in (headers or {}).items()
+                     if k.lower() not in SKIPPED_REQUEST_HEADERS}
+        forwarded.setdefault('User-Agent', 'http-cache-proxy')
+        request = urllib.request.Request(url, headers=forwarded)
         with urllib.request.urlopen(request, timeout=UPSTREAM_TIMEOUT) as resp:
             body = resp.read()
             declared = resp.headers.get('Content-Length')
@@ -312,7 +328,7 @@ class HTTPCache:
         started = time.monotonic()
         try:
             status, headers, body, final_url = await asyncio.to_thread(
-                self._fetch, url
+                self._fetch, url, dict(flow.request.headers)
             )
         except Exception as exc:
             # Left to the client to retry or fail: the proxy reports what went
