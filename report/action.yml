@@ -54,6 +54,22 @@ runs:
         FAIL_ON_BLOCKED: ${{ inputs.fail-on-blocked }}
       run: |
         set -eu
+        # Clear the proxy settings BEFORE stopping the proxy.  $GITHUB_ENV
+        # takes effect for later steps, so by the time anything else runs --
+        # this action's own actions/cache/save, or the caller's
+        # upload-artifact -- the variables are gone and it connects directly.
+        # Leaving them set while the proxy is dead is a connection refused to
+        # 127.0.0.1 in a step that has nothing to do with downloading, long
+        # after the job's real work succeeded.  The CA variables can stay:
+        # they name a bundle that is the system one plus our certificate, so
+        # they are harmless without a proxy.
+        if [ -n "${GITHUB_ENV:-}" ]; then
+          for var in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY \
+                     no_proxy NO_PROXY; do
+            echo "$var=" >> "$GITHUB_ENV"
+          done
+        fi
+
         state="${STATE_INPUT:-${HTTP_CACHE_STATE:-}}"
         if [ -z "$state" ]; then
           echo "::notice::no http cache was started, nothing to report"
