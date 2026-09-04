@@ -5,6 +5,15 @@ description: >
   reported even when the job failed.
 
 inputs:
+  fail-on-blocked:
+    description: >
+      Fail if the cache refused any request in strict mode.  A refusal already
+      gives the client a 504, which normally fails whatever wanted the file --
+      but not if that download is tolerated or wrapped in continue-on-error,
+      and then strict mode's guarantee is violated in a green run.  This makes
+      the refusal itself the failure.
+    required: false
+    default: 'true'
   assert-used:
     description: >
       Fail if the proxy served no requests at all.  A cache that is never
@@ -42,6 +51,7 @@ runs:
         STATE_INPUT: ${{ inputs.state-dir }}
         KEY_INPUT: ${{ inputs.cache-key }}
         ASSERT_USED: ${{ inputs.assert-used }}
+        FAIL_ON_BLOCKED: ${{ inputs.fail-on-blocked }}
       run: |
         set -eu
         state="${STATE_INPUT:-${HTTP_CACHE_STATE:-}}"
@@ -101,18 +111,21 @@ runs:
             "$state/events.jsonl" "$mode" | tee -a "$GITHUB_STEP_SUMMARY"
         echo "::endgroup::"
 
+        failed=0
         if [ "$blocked" -gt 0 ]; then
           echo "::error::$blocked request(s) were refused because they are not"\
                "in the cache. Label this pull request 'ci-http-cache-record'"\
                "to let it populate the cache, or run the cache-refresh"\
                "workflow on the default branch."
+          [ "$FAIL_ON_BLOCKED" = "true" ] && failed=1
         fi
         if [ "$ASSERT_USED" = "true" ] \
            && [ "$((hits + stored + blocked + forwarded))" -eq 0 ]; then
           echo "::error::the http cache proxy served no requests at all, so"\
                "nothing in this job was routed through it"
-          exit 1
+          failed=1
         fi
+        exit "$failed"
 
     - name: Save the download cache
       if: steps.stop.outputs.should-save == 'true'
