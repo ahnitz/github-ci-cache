@@ -13,12 +13,25 @@ does not have to know a cache exists.
 Three modes, from ``HTTP_CACHE_MODE``:
 
 record
-    A miss is fetched from upstream and stored.  What the default branch and
-    a scheduled cache-refresh job use.
+    The default, and what every job uses.  A hit is served from disk; a miss
+    goes to the origin exactly as it would without a proxy, and is then
+    stored.  So the cache can only make a job faster or more reliable, never
+    less: with nothing cached at all this is the behaviour the job had before.
+    Shrinking the surface where CI can break matters more than hermeticity --
+    the point is not to add a new place for it to break.
+
+    Pull requests write too, deliberately.  Someone iterating on a branch and
+    re-running CI is exactly who benefits most, and a pull request's cache can
+    only be read by that same pull request, so it cannot affect anyone else.
+    Cruft accumulated this way is cleared by rebuilding the cache, which is
+    simpler than arranging for one writer.
 strict
-    A miss fails with a 504 naming the URL.  Pull requests use this, so an
-    upstream outage cannot break them, and a developer can prove a test needs
-    nothing beyond the cache.
+    A miss fails with a 504 naming the URL.  Not for ordinary use: it proves a
+    workload needs nothing but the cache, which is worth doing deliberately --
+    with the network removed, say -- and not worth imposing on a pull request,
+    where it would mean that adding a test that downloads something turns CI
+    red until somebody populates the cache.  That is the tax this action
+    exists to remove.
 off
     Handled by the launcher, which starts no proxy at all.
 
@@ -217,6 +230,12 @@ class HTTPCache:
     async def request(self, flow: http.HTTPFlow):
         try:
             await self._handle(flow)
+        except Exception as exc:
+            # As above: never fail a request because the cache misbehaved.
+            # Leaving flow.response unset lets mitmproxy fetch it normally.
+            self.stats['error'] += 1
+            logger.warning('cache bypassed for %s: %s: %s',
+                           flow.request.pretty_url, type(exc).__name__, exc)
         finally:
             self._save_stats()
 
@@ -246,13 +265,22 @@ class HTTPCache:
 
         def tee(chunk):
             # mitmproxy calls this for each chunk and finally with b'' to
-            # signal the end of the body.
-            if chunk:
-                chunks.append(chunk)
-                return chunk
-            body = b''.join(chunks)
-            self._finish(url, flow, body, declared,
-                         (time.monotonic() - started) * 1000)
+            # signal the end of the body.  The chunk is returned unchanged
+            # whatever happens here: this function sits in the path of a
+            # response the client is already reading, so a fault in the cache
+            # must not become a fault in the download.  A cache that cannot
+            # store something is a slow CI job; a cache that breaks the
+            # response is a broken CI job, which is what it exists to prevent.
+            try:
+                if chunk:
+                    chunks.append(chunk)
+                else:
+                    self._finish(url, flow, b''.join(chunks), declared,
+                                 (time.monotonic() - started) * 1000)
+            except Exception as exc:
+                self.stats['store_failed'] += 1
+                logger.warning('not caching %s: %s: %s',
+                               url, type(exc).__name__, exc)
             return chunk
 
         flow.response.stream = tee
