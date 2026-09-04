@@ -102,6 +102,14 @@ the label cannot affect anyone else's cache.
   exactly what the job did before this action existed — downloads go straight
   out — so it warns and carries on rather than inventing a new way for CI to
   fail.
+- **Only allow-listed hosts are intercepted; everything else is tunnelled
+  blindly.** A tunnelled connection never sees a substituted certificate, so
+  it never has to be taught to trust one — which removes a whole class of
+  failure rather than patching its instances. `api.github.com` is tunnelled
+  too even though it is a subdomain of an allow-listed `github.com`, because
+  that is where a job's token goes. Verified: with only the system CA
+  available, an allow-listed host fails (it is intercepted) and a
+  non-allow-listed one succeeds (it is not).
 - **Node needs its own CA variable, and GitHub's actions are Node programs.**
   They honour `http_proxy`, so they get sent through the proxy, but they verify
   TLS against Node's bundled roots and read none of the other CA variables.

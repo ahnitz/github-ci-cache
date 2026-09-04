@@ -131,6 +131,43 @@ start() {
     mkdir -p "$CACHE_DIR" "$CONF_DIR"
     rm -f "$EVENTS"
 
+    # Only intercept what we mean to cache.  Everything else is tunnelled
+    # blindly, so it never sees a substituted certificate and never needs to
+    # be taught to trust one.  This is the structural version of the no_proxy
+    # list: enumerating what to bypass is guesswork and gets it wrong (Node
+    # actions verifying TLS against their own roots is how that surfaced),
+    # whereas the set we *do* want to intercept is known exactly.
+    #
+    # ignore_hosts matches on host:port, before any request line is read, so
+    # it can only key on the host -- a host that appears in the allow list with
+    # a path prefix is still intercepted, and the path is applied afterwards.
+    # Two patterns, whose union is "tunnel this blindly".  Anything tunnelled
+    # never sees a substituted certificate and so never has to be taught to
+    # trust one.
+    #
+    #   1. every host that is not in the allow list
+    #   2. every host in no_proxy, even if the allow list would cover it --
+    #      api.github.com is a subdomain of an allow-listed github.com, and
+    #      that is where a job's token goes.  It should never reach a process
+    #      that terminates TLS, whether or not the client honoured no_proxy.
+    local ignore_other ignore_sensitive
+    ignore_other=$(python3 - "$HTTP_CACHE_HOSTS" <<'PY'
+import re, sys
+hosts = sorted({e.strip().lower().split('/')[0]
+                for e in sys.argv[1].split(',') if e.strip()})
+alt = '|'.join(re.escape(h) for h in hosts)
+print(f'^(?!(?:[^.]+\\.)*(?:{alt})(?::\\d+)?$).*')
+PY
+)
+    ignore_sensitive=$(python3 - "$NO_PROXY_HOSTS" <<'PY'
+import re, sys
+hosts = sorted({e.strip().lower() for e in sys.argv[1].split(',')
+                if e.strip() and not e.strip().startswith(('127.', '::', 'localhost'))})
+alt = '|'.join(re.escape(h) for h in hosts)
+print(f'^(?:[^.]+\\.)*(?:{alt})(?::\\d+)?$')
+PY
+)
+
     local mitmdump="${HTTP_CACHE_MITMDUMP:-mitmdump}"
     if ! command -v "$mitmdump" >/dev/null 2>&1; then
         log "http-cache: $mitmdump is not on PATH (pip install mitmproxy)"
@@ -149,6 +186,8 @@ start() {
         --listen-port "$PORT" \
         --set confdir="$CONF_DIR" \
         --set upstream_cert=false \
+        --ignore-hosts "$ignore_other" \
+        --ignore-hosts "$ignore_sensitive" \
         --set connection_strategy=lazy \
         --set termlog_verbosity=info \
         --set flow_detail=0 \
