@@ -12,7 +12,7 @@
 # Environment:
 #   HTTP_CACHE_MODE       record (default) | strict | off
 #   HTTP_CACHE_STATE      where the cache and the proxy's files live
-#   HTTP_CACHE_HOSTS      comma-separated hosts to cache (required)
+#   HTTP_CACHE_HOSTS      optional: cache ONLY these hosts (default: all)
 #   HTTP_CACHE_NO_PROXY   comma-separated hosts to keep off the proxy
 #   HTTP_CACHE_PORT       listen port, default 3128
 #   HTTP_CACHE_MITMDUMP   mitmdump to use, default the one on PATH
@@ -40,7 +40,9 @@ EVENTS="$STATE/events.jsonl"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ADDON="$HERE/http_cache_proxy.py"
 
-# Hosts kept off the proxy altogether.  Three groups, for three reasons:
+# The deny list.  Nothing here is specific to any project, which is the whole
+# point: it decides what is NOT cached, so a caller lists nothing.  Three
+# groups, for three reasons:
 # the package ecosystems carry their own caches and would dominate the cache
 # budget; the GitHub API is where a job's token goes, and nothing carrying a
 # credential should pass through a process that terminates TLS; and the Actions
@@ -123,10 +125,6 @@ start() {
         log "http-cache: mode is off, starting no proxy"
         return 0
     fi
-    if [ -z "${HTTP_CACHE_HOSTS:-}" ]; then
-        log "http-cache: HTTP_CACHE_HOSTS is empty, nothing would be cached"
-        return 1
-    fi
 
     mkdir -p "$CACHE_DIR" "$CONF_DIR"
     rm -f "$EVENTS"
@@ -141,25 +139,15 @@ start() {
     # ignore_hosts matches on host:port, before any request line is read, so
     # it can only key on the host -- a host that appears in the allow list with
     # a path prefix is still intercepted, and the path is applied afterwards.
-    # Two patterns, whose union is "tunnel this blindly".  Anything tunnelled
-    # never sees a substituted certificate and so never has to be taught to
-    # trust one.
-    #
-    #   1. every host that is not in the allow list
-    #   2. every host in no_proxy, even if the allow list would cover it --
-    #      api.github.com is a subdomain of an allow-listed github.com, and
-    #      that is where a job's token goes.  It should never reach a process
-    #      that terminates TLS, whether or not the client honoured no_proxy.
-    local ignore_other ignore_sensitive
-    ignore_other=$(python3 - "$HTTP_CACHE_HOSTS" <<'PY'
-import re, sys
-hosts = sorted({e.strip().lower().split('/')[0]
-                for e in sys.argv[1].split(',') if e.strip()})
-alt = '|'.join(re.escape(h) for h in hosts)
-print(f'^(?!(?:[^.]+\\.)*(?:{alt})(?::\\d+)?$).*')
-PY
-)
-    ignore_sensitive=$(python3 - "$NO_PROXY_HOSTS" <<'PY'
+    # Tunnel exactly the deny list, and intercept everything else so that it
+    # can be cached.  This is the inverse of the first version, which tunnelled
+    # everything *except* an allow list: that made caching depend on each
+    # project listing its own hosts, which is the metadata this exists to
+    # remove.  What has to be excluded is generic -- package registries, the
+    # GitHub API, the Actions services -- so it ships here and a project
+    # configures nothing.
+    local ignore
+    ignore=$(python3 - "$NO_PROXY_HOSTS" <<'PY'
 import re, sys
 hosts = sorted({e.strip().lower() for e in sys.argv[1].split(',')
                 if e.strip() and not e.strip().startswith(('127.', '::', 'localhost'))})
@@ -180,14 +168,14 @@ PY
     HTTP_CACHE_DIR="$CACHE_DIR" \
     HTTP_CACHE_MODE="$MODE" \
     HTTP_CACHE_STATS="$STATS" \
+    HTTP_CACHE_DENY="$NO_PROXY_HOSTS" \
     HTTP_CACHE_EVENTS="$EVENTS" \
     run_unproxied "$mitmdump" \
         --listen-host 127.0.0.1 \
         --listen-port "$PORT" \
         --set confdir="$CONF_DIR" \
         --set upstream_cert=false \
-        --ignore-hosts "$ignore_other" \
-        --ignore-hosts "$ignore_sensitive" \
+        --ignore-hosts "$ignore" \
         --set connection_strategy=lazy \
         --set termlog_verbosity=info \
         --set flow_detail=0 \

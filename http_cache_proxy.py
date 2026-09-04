@@ -44,11 +44,18 @@ that took longer than that upstream failed with a client-side read timeout.
 Letting mitmproxy stream from the origin, and storing the body in the response
 hook, is both correct and less code.
 
-Only allow-listed hosts are cached; anything else is forwarded untouched.  The
-package ecosystems (PyPI, conda channels, apt) are kept off the proxy
-altogether by ``no_proxy`` in the launcher -- they carry their own caches, they
-would dominate the cache budget, and keeping them away from a process that
-terminates TLS keeps credentials out of it.
+What gets cached is decided by exclusion, not by a list.  Anything a job
+downloads is cached unless it is on the deny list, which is generic: the
+package ecosystems (PyPI, conda channels, apt) because they carry their own
+caches and would dominate the budget, the GitHub API and the Actions services
+because that is where a job's credentials go, and the git smart-HTTP endpoints
+because they are a protocol rather than a file.
+
+Nothing on that list is specific to any project, so a project configures
+nothing.  The alternative -- each caller listing the hosts worth caching --
+was tried first and is the same failure it set out to fix: metadata to keep in
+step with the tests by hand, in every workflow file, silently doing nothing
+when a host is forgotten.
 """
 
 import asyncio
@@ -95,6 +102,12 @@ SKIPPED_RESPONSE_HEADERS = frozenset({
 })
 
 
+# Paths belonging to a protocol rather than a file.  git's smart-HTTP
+# endpoints are the ones that matter: they are per-clone, never worth storing,
+# and caching them would break `pip install git+https://...`.
+DENIED_PATH_PARTS = ('/info/refs', '/git-upload-pack', '/git-receive-pack')
+
+
 def _parse_patterns(spec):
     """Parse the allow list into ``(host, path_prefix)`` pairs.
 
@@ -116,8 +129,8 @@ def _parse_patterns(spec):
     return tuple(patterns)
 
 
-def _url_allowed(host, path, patterns):
-    """Whether this host and path are ones we are meant to be caching."""
+def _matches(host, path, patterns):
+    """Whether this host and path match any of ``patterns``."""
     host = host.lower()
     for pattern_host, pattern_path in patterns:
         if not (host == pattern_host or host.endswith('.' + pattern_host)):
@@ -139,9 +152,10 @@ class HTTPCache:
             raise SystemExit(
                 f'HTTP_CACHE_MODE must be record or strict, got {self.mode!r}'
             )
+        # An explicit allow list is an override, not the normal case.  Empty
+        # (the default) means "cache anything that is not denied".
         self.allowed = _parse_patterns(os.environ.get('HTTP_CACHE_HOSTS', ''))
-        if not self.allowed:
-            raise SystemExit('HTTP_CACHE_HOSTS is empty, nothing would cache')
+        self.denied = _parse_patterns(os.environ.get('HTTP_CACHE_DENY', ''))
         self.stats = Counter()
         self.stats_path = os.path.abspath(os.environ.get(
             'HTTP_CACHE_STATS', os.path.join(self.root, os.pardir, 'stats.json')
@@ -155,8 +169,11 @@ class HTTPCache:
         ))
         os.makedirs(self.root, exist_ok=True)
         logger.info(
-            'http cache in %s mode, %d patterns cached, cache dir %s',
-            self.mode, len(self.allowed), self.root
+            'http cache in %s mode, %s, %d hosts denied, cache dir %s',
+            self.mode,
+            (f'{len(self.allowed)} allow patterns'
+             if self.allowed else 'caching anything not denied'),
+            len(self.denied), self.root
         )
 
     # -- cache layout ----------------------------------------------------
@@ -250,12 +267,9 @@ class HTTPCache:
         """
         if flow.response is None or getattr(flow, 'from_cache', False):
             return
-        if not _url_allowed(flow.request.pretty_host, flow.request.path,
-                            self.allowed):
-            return
-        if flow.request.method != 'GET' or 'range' in flow.request.headers:
-            return
         if flow.response.status_code not in CACHEABLE_STATUS:
+            return
+        if not self._cacheable(flow, flow.request.pretty_url, count=False):
             return
 
         url = flow.request.pretty_url
@@ -314,10 +328,7 @@ class HTTPCache:
         url = flow.request.pretty_url
         method = flow.request.method
 
-        if not _url_allowed(flow.request.pretty_host, flow.request.path,
-                            self.allowed):
-            self.stats['forwarded'] += 1
-            self._log_event('FORWARD', url, note='not in the allow list')
+        if not self._cacheable(flow, url):
             return
         if method != 'GET' or 'range' in flow.request.headers:
             # A partial or non-GET request is forwarded rather than stored: it
@@ -372,6 +383,34 @@ class HTTPCache:
         # the most interesting thing in the log when something goes wrong.
         self.stats['miss'] += 1
         self._log_event('MISS', url, note='not cached, fetching from origin')
+
+    def _cacheable(self, flow, url, count=True):
+        """Whether this request is one we should be storing.
+
+        Decided by exclusion: everything is cacheable unless it is denied, or
+        is not a plain whole-object GET.  An explicit allow list, if the caller
+        supplied one, narrows it further.
+        """
+        host, path = flow.request.pretty_host, flow.request.path
+        why = None
+        if _matches(host, path, self.denied):
+            why = 'denied host'
+        elif any(part in path for part in DENIED_PATH_PARTS):
+            why = 'git protocol endpoint, not a file'
+        elif self.allowed and not _matches(host, path, self.allowed):
+            why = 'not in the allow list'
+        elif flow.request.method != 'GET':
+            why = f'{flow.request.method}, not GET'
+        elif 'range' in flow.request.headers:
+            # Correct caching of a partial response needs a key per byte
+            # range; forwarding is the honest answer.
+            why = 'range request'
+        if why is None:
+            return True
+        if count:
+            self.stats['forwarded'] += 1
+            self._log_event('FORWARD', url, note=why)
+        return False
 
     def _log_event(self, disposition, url, bytes_=0, elapsed_ms=0, note=''):
         """Append one request to the event log, and say so at INFO.

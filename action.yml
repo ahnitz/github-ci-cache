@@ -7,16 +7,15 @@ description: >
 inputs:
   hosts:
     description: >
-      Comma-separated hosts, each optionally followed by a path prefix:
-      "raw.githubusercontent.com" or
-      "github.com/gwastro/pycbc_data/releases/download/".  A subdomain of a
-      listed host matches.  Anything not listed is forwarded untouched -- it
-      still works, it is just neither stored nor, in strict mode, refused.
-      Prefer the narrowest prefix that covers the data: a bare "github.com"
-      also captures the git smart-HTTP endpoints, so strict mode would refuse
-      "pip install git+https://github.com/...".  There is no default, because
-      which URLs are worth caching is a property of the project.
-    required: true
+      Optional.  Restrict caching to these hosts, each optionally followed by
+      a path prefix.  Empty (the default) caches anything that is not on the
+      built-in deny list -- the package registries, the GitHub API and Actions
+      services, and the git smart-HTTP endpoints -- none of which is specific
+      to any project.  Set this only to narrow that deliberately: a list of
+      hosts to cache has to be kept in step with the tests by hand, and does
+      nothing at all when a host is forgotten.
+    required: false
+    default: ''
   mode:
     description: >
       "record" fetches and stores on a miss.  "strict" fails a miss with a 504,

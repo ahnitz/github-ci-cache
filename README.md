@@ -9,19 +9,17 @@ lists, no prefetch manifest to keep in step with the tests by hand.
 
 ```yaml
     - uses: ahnitz/github-ci-cache@v1
-      with:
-        hosts: >-
-          gwosc.org,dcc.ligo.org,zenodo.org,raw.githubusercontent.com,
-          github.com/myorg/mydata/releases/download/
 
     - name: run the test suite
       run: pytest
 
     - uses: ahnitz/github-ci-cache/report@v1
       if: always()
-      with:
-        assert-used: true
 ```
+
+No inputs. There is nothing to configure because there is no list of hosts to
+keep: everything a job downloads is cached unless it is on a deny list that
+ships with the action and is the same for every project.
 
 That is the whole integration. The code doing the downloading is not
 changed, and does not know a cache exists.
@@ -157,9 +155,16 @@ can assert on. That is what this directory is.
 
 ## Inputs
 
-See `action.yml` and `report/action.yml`. The only required input is `hosts`:
-which hosts are worth caching is a property of the project, and caching
-everything that passes through would blow the cache budget.
+There are none you need. Every input has a default; see `action.yml` and
+`report/action.yml` for the overrides that exist (`mode`, `hosts`, `port`,
+`cache-key`, and the mitmproxy pin).
+
+`hosts` deserves a note: it restricts caching to a list you supply, and it is
+there for a caller who wants that deliberately. It was once required, which
+was the wrong default — a list of hosts to cache has to be kept in step with
+the tests by hand, and does nothing at all when a host is forgotten. Deciding
+by exclusion instead means the thing that must be maintained is generic, so
+it lives here.
 
 ## Locally
 
