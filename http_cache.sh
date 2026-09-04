@@ -12,7 +12,6 @@
 # Environment:
 #   HTTP_CACHE_MODE       record (default) | strict | off
 #   HTTP_CACHE_STATE      where the cache and the proxy's files live
-#   HTTP_CACHE_HOSTS      optional: cache ONLY these hosts (default: all)
 #   HTTP_CACHE_NO_PROXY   comma-separated hosts to keep off the proxy
 #   HTTP_CACHE_PORT       listen port, default 3128
 #   HTTP_CACHE_MITMDUMP   mitmdump to use, default the one on PATH

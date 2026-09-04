@@ -21,36 +21,17 @@ denied.  mitmproxy fetches from the origin and the body is copied out of the
 response stream, so the client gets its first byte immediately.
 """
 
-import asyncio
 import hashlib
 import json
 import logging
 import os
 import shutil
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from collections import Counter
 
 from mitmproxy import http
 
 logger = logging.getLogger('http_cache_proxy')
-
-# Request headers NOT to pass upstream: hop-by-hop, or ones that describe the
-# connection to the proxy rather than the request being made.  Everything else
-# is forwarded, so the origin sees the request the client actually made.
-# Substituting our own User-Agent and Accept is a way to get different
-# behaviour out of a picky server for no reason -- a caching proxy should
-# replay the request, not paraphrase it.
-SKIPPED_REQUEST_HEADERS = frozenset({
-    'host', 'connection', 'proxy-connection', 'keep-alive', 'te', 'trailer',
-    'transfer-encoding', 'upgrade', 'accept-encoding',
-})
-
-# Response headers worth replaying.  Deliberately not the hop-by-hop ones, and
-# deliberately not Content-Encoding: the stored body is already decoded.
-REPLAYED_HEADERS = ('content-type', 'last-modified', 'etag')
 
 # Redirects are kept as well as 200s: a client following a chain asks for each
 # hop, so replaying the 3xx sends it to the target that was stored too.
@@ -70,7 +51,7 @@ DENIED_PATH_PARTS = ('/info/refs', '/git-upload-pack', '/git-receive-pack')
 
 
 def _parse_patterns(spec):
-    """Parse ``host`` or ``host/path/prefix`` entries into pairs."""
+    """Parse the deny list's ``host`` or ``host/path/prefix`` entries."""
     patterns = []
     for entry in spec.split(','):
         entry = entry.strip().lower().lstrip('/')
@@ -104,8 +85,6 @@ class HTTPCache:
             raise SystemExit(
                 f'HTTP_CACHE_MODE must be record or strict, got {self.mode!r}'
             )
-        # An allow list is an override; empty means "anything not denied".
-        self.allowed = _parse_patterns(os.environ.get('HTTP_CACHE_HOSTS', ''))
         self.denied = _parse_patterns(os.environ.get('HTTP_CACHE_DENY', ''))
         self.stats = Counter()
         self.stats_path = os.path.abspath(os.environ.get(
@@ -118,13 +97,8 @@ class HTTPCache:
             os.path.join(self.root, os.pardir, 'events.jsonl')
         ))
         os.makedirs(self.root, exist_ok=True)
-        logger.info(
-            'http cache in %s mode, %s, %d hosts denied, cache dir %s',
-            self.mode,
-            (f'{len(self.allowed)} allow patterns'
-             if self.allowed else 'caching anything not denied'),
-            len(self.denied), self.root
-        )
+        logger.info('http cache in %s mode, %d hosts denied, cache dir %s',
+                    self.mode, len(self.denied), self.root)
 
     # -- cache layout ----------------------------------------------------
     #
@@ -191,9 +165,9 @@ class HTTPCache:
 
     # -- mitmproxy hooks -------------------------------------------------
 
-    async def request(self, flow: http.HTTPFlow):
+    def request(self, flow: http.HTTPFlow):
         try:
-            await self._handle(flow)
+            self._handle(flow)
         except Exception as exc:
             # Never fail a request because the cache misbehaved: leaving
             # flow.response unset lets mitmproxy fetch it normally.
@@ -210,11 +184,9 @@ class HTTPCache:
         on, and a client with a read timeout of a few seconds gives up on any
         large download.
         """
-        if flow.response is None or getattr(flow, 'from_cache', False):
-            return
-        if flow.response.status_code not in CACHEABLE_STATUS:
-            return
-        if not self._cacheable(flow, flow.request.pretty_url, count=False):
+        if not self._storable(flow) or flow.response.status_code != 200:
+            # A redirect carries no body, so the stream callback never fires;
+            # response() stores those instead.
             return
 
         url = flow.request.pretty_url
@@ -241,6 +213,25 @@ class HTTPCache:
 
         flow.response.stream = tee
 
+    def response(self, flow: http.HTTPFlow):
+        """Store the responses that carry no body, chiefly redirects.
+
+        Not storing a redirect means re-resolving it every run, and where the
+        target is a signed URL that is a fresh cache entry each time: the
+        payload is downloaded again and a second copy kept.
+        """
+        if not self._storable(flow) or flow.response.status_code == 200:
+            return
+        self._finish(flow.request.pretty_url, flow,
+                     flow.response.content or b'', None, 0)
+
+    def _storable(self, flow: http.HTTPFlow):
+        """Whether this response is one to keep."""
+        return (flow.response is not None
+                and not getattr(flow, 'from_cache', False)
+                and flow.response.status_code in CACHEABLE_STATUS
+                and self._cacheable(flow, flow.request.pretty_url, count=False))
+
     def _finish(self, url, flow, body, declared, elapsed_ms):
         """Store a completed response, unless it arrived short."""
         # A body short of its promised length is never stored: Git LFS serves
@@ -265,7 +256,7 @@ class HTTPCache:
         self._log_event('STORE', url, len(body), elapsed_ms, note)
         self._save_stats()
 
-    async def _handle(self, flow: http.HTTPFlow):
+    def _handle(self, flow: http.HTTPFlow):
         url = flow.request.pretty_url
         method = flow.request.method
 
@@ -322,15 +313,13 @@ class HTTPCache:
 
     def _cacheable(self, flow, url, count=True):
         """Whether to store this request: anything not denied, and a plain
-        whole-object GET.  An allow list, if given, narrows it further."""
+        whole-object GET."""
         host, path = flow.request.pretty_host, flow.request.path
         why = None
         if _matches(host, path, self.denied):
             why = 'denied host'
         elif any(part in path for part in DENIED_PATH_PARTS):
             why = 'git protocol endpoint, not a file'
-        elif self.allowed and not _matches(host, path, self.allowed):
-            why = 'not in the allow list'
         elif flow.request.method != 'GET':
             why = f'{flow.request.method}, not GET'
         elif 'range' in flow.request.headers:

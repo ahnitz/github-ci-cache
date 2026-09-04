@@ -1,183 +1,97 @@
 # github-ci-cache
 
-A caching HTTP proxy for CI jobs, as a GitHub Action.
-
-Route a job's downloads through a userspace caching proxy, so that data files
-tests need come from a cache instead of the network. Nothing in the project
-being tested has to know the cache exists — no retry wrappers, no mirror
-lists, no prefetch manifest to keep in step with the tests by hand.
+Caches the files a CI job downloads, so a flaky origin server stops failing
+your build. Nothing in the project being tested has to change.
 
 ```yaml
     - uses: ahnitz/github-ci-cache@v1
 
-    - name: run the test suite
+    - name: run the tests
       run: pytest
 
     - uses: ahnitz/github-ci-cache/report@v1
       if: always()
 ```
 
-No inputs. There is nothing to configure because there is no list of hosts to
-keep: everything a job downloads is cached unless it is on a deny list that
-ships with the action and is the same for every project.
-
-That is the whole integration. The code doing the downloading is not
-changed, and does not know a cache exists.
+That is the whole integration. No inputs.
 
 ## What it does
 
-`http_cache.sh start` launches `mitmdump` on `127.0.0.1` with the addon in
-`http_cache_proxy.py`, then exports the settings that make every client use
-it: `http_proxy`/`https_proxy`, plus the CA bundle under each of the six names
-its clients read — `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`,
-`WGETRC`, `WGET2RC`, `GIT_SSL_CAINFO` and `NODE_EXTRA_CA_CERTS`. Even that is not enough for every
-client; see the `certifi` note below. In Actions the settings go to
-`$GITHUB_ENV`, so the rest of the job picks them up.
+The first step starts a caching proxy on localhost and points every client at
+it — `curl`, `wget`, `git`, `urllib`, `requests`, `astropy`. A file that was
+downloaded by an earlier run is served from disk; anything else goes to the
+origin as normal and is then stored. The cache can only make a job faster or
+more reliable, never less: with nothing cached at all, the job behaves exactly
+as it did before.
 
-A request to an allow-listed host is answered from disk if it is there. On a
-miss the proxy either fetches and stores it (`record`) or refuses with a 504
-naming the URL (`strict`). Anything not allow-listed is forwarded untouched.
+The second step stops the proxy, prints what happened, and saves the cache.
 
-### Modes
+Everything a job downloads is cached, except:
 
-`mode: auto` — the default — is **strict on pull requests and record
-everywhere else**. Pull requests are then hermetic: an upstream outage cannot
-break one. The default branch and scheduled runs populate the cache.
+- the package registries (PyPI, conda, apt), which have their own caches
+- the GitHub API and the Actions services, which carry your credentials
+- git's smart-HTTP endpoints, which are a protocol rather than a file
+- non-`GET` and range requests
 
-A pull request that adds a *new* download would deadlock on that, so labelling
-it `ci-http-cache-record` switches it to record mode. A cache written by a
-pull request run can only be restored by re-runs of that same pull request, so
-the label cannot affect anyone else's cache.
+There is no list of hosts to maintain.
 
-### Details that matter
+## What you get in the log
 
-- **`upstream_cert=false`** is what makes a cache hit need no network at all.
-  By default mitmproxy fetches the real certificate to mint a lookalike, which
-  contacts the origin server even when the answer is already on disk.
-- **The CA bundle is the system bundle with our CA appended**, never our CA
-  alone, so anything deliberately bypassing the proxy keeps its trust roots.
-- **The response is streamed to the client and copied into the cache as it
-  passes.** This is not an optimisation. The proxy used to fetch each object
-  itself and hand it over complete, so the client got nothing — not even a
-  status line — until the whole download had finished. astropy's
-  `download_file` allows 10 seconds, so every large file failed with a
-  client-side read timeout. Redirects are cached as redirects instead of being
-  collapsed: replaying the same 3xx sends the client to the same target, which
-  is the hop we also stored.
-- **Retrying lives here, not in each client.** The proxy is the only thing
-  that talks to the origin server now, so one policy (4 attempts, capped
-  back-off, no retry on a definitive 4xx) covers every caller — including a
-  plain `curl` or `wget` with no flags of its own.
-- **A body whose length disagrees with `Content-Length` is never cached.** A
-  truncated body under a 200 is a real failure mode — Git LFS does it when a
-  bandwidth quota is spent — and refusing to store it turns a wrong answer
-  into a retryable error.
-- **The cache is saved only when something new was stored**, so an unchanged
-  cache is not re-uploaded every run. That matters against a 10 GB
-  per-repository budget with least-recently-used eviction.
-- **The allow list takes path prefixes, and should use them.** A bare host
-  makes everything on it cacheable, which in strict mode means refused. A bare
-  `github.com` covers the release assets we want *and* the git smart-HTTP
-  endpoints we do not, so strict mode would refuse
-  `pip install git+https://github.com/...`. Measured: with the prefix form, a
-  `git clone` over https is `forwarded`, neither cached nor blocked.
-- **Some clients ignore every CA variable there is.** astropy's
-  `download_file` does `ssl.create_default_context(cafile=certifi.where())`,
-  and `create_default_context` with an explicit `cafile` never consults
-  `SSL_CERT_FILE`. A `sitecustomize.py` on `PYTHONPATH` overrides
-  `certifi.where()`, which covers every certifi-based client without touching
-  site-packages. It does shadow a project's own `sitecustomize`;
-  `HTTP_CACHE_NO_SITECUSTOMIZE=1` skips it.
-- **There are two wgets.** GNU wget 1.x reads `$WGETRC`; wget2 — what Fedora
-  and others install as `wget` — reads `$WGET2RC` and ignores `$WGETRC`. Both
-  are exported. Getting it wrong does not fail cleanly: wget2 with an
-  untrusted certificate **hangs** until killed instead of reporting the
-  verification failure, which in CI reads as a stuck job.
-- **The proxy picks its own interpreter.** mitmproxy 12 requires Python 3.12,
-  and the job's `python3` belongs to the project's test matrix — on a 3.11 leg
-  the install would fail for a reason that has nothing to do with the project.
-  The action looks for a suitable interpreter itself and runs the proxy in a
-  virtual environment of its own, so the project's environment is untouched.
-- **A proxy that cannot start is fatal only where it has to be.** In strict
-  mode the guarantee is that nothing reaches the network, so there is nothing
-  safe to fall back to and the job fails. In record mode the fall-back is
-  exactly what the job did before this action existed — downloads go straight
-  out — so it warns and carries on rather than inventing a new way for CI to
-  fail.
-- **Only allow-listed hosts are intercepted; everything else is tunnelled
-  blindly.** A tunnelled connection never sees a substituted certificate, so
-  it never has to be taught to trust one — which removes a whole class of
-  failure rather than patching its instances. `api.github.com` is tunnelled
-  too even though it is a subdomain of an allow-listed `github.com`, because
-  that is where a job's token goes. Verified: with only the system CA
-  available, an allow-listed host fails (it is intercepted) and a
-  non-allow-listed one succeeds (it is not).
-- **Node needs its own CA variable, and GitHub's actions are Node programs.**
-  They honour `http_proxy`, so they get sent through the proxy, but they verify
-  TLS against Node's bundled roots and read none of the other CA variables.
-  Without `NODE_EXTRA_CA_CERTS`, `actions/upload-artifact` fails — after the
-  job's real work has already succeeded, which makes it a confusing failure to
-  read. Their hosts should all be in `no_proxy` too, but an action meant to
-  reduce fragility should not rely on that list being exhaustive.
-- **`no_proxy` excludes three groups**: the package ecosystems (own caches,
-  would dominate the budget), the GitHub API (a job's token should not pass
-  through a process that terminates TLS), and the Actions cache service
-  itself (or the proxy sits in the path of its own persistence).
+One line per request, outcome first:
 
-## Verified
+```
+STORE      2492 B   96ms  https://raw.githubusercontent.com/…/README.md
+HIT        2492 B      -  https://raw.githubusercontent.com/…/README.md
+MISS            -      -  https://gwosc.org/eventapi/json/
+FORWARD         -      -  https://github.com/org/repo/info/refs?service=git-upload-pack
+```
 
-Recorded cold, then replayed in strict mode with **both the proxy and the
-clients inside a network namespace with no route off loopback**, where a direct
-fetch was confirmed impossible. `curl`, `wget`, `urllib`, `requests`,
-`astropy.download_file` and `git clone` all worked; the bodies came back
-byte-identical to the recorded ones; a URL that was not in the cache got a 504.
+plus a job summary listing every URL under its outcome, and how many bytes
+were served without touching the network.
 
-A server that declares 1000 bytes and sends 100 -- the Git LFS quota failure --
-is retried and then reported as a 502, and **nothing is cached**, verified
-against a deliberately lying local server.
+## The cache itself
 
-## Why not something off the shelf
+One Actions cache entry called `http-cache`, replaced each time something new
+is stored. Deleting it from the repository's cache page is safe; the next run
+fills it again.
 
-| Candidate | Why it does not fit |
-|---|---|
-| [`cirruslabs/http-cache-action`](https://github.com/cirruslabs/http-cache-action) | Despite the name, a key/value cache **API** for Gradle/Bazel/Buck, not a forward proxy. Does not cache ordinary downloads. |
-| [`airtasker/proxay`](https://github.com/airtasker/proxay) | Closest in intent, but a **reverse** proxy the client must point at per backend, not `http_proxy`. Tapes are YAML with inline bodies — unusable for 100–300 MB binaries. |
-| [`chayleaf/mitm-cache`](https://github.com/chayleaf/mitm-cache) | Mechanically closest: Rust MITM forward proxy, own CA, record then replay offline. But it is built for Nix and its store is a **lockfile of hashes you commit** — which is the hand-maintained manifest this exists to delete. |
-| [`mtib/mitm-cache`](https://github.com/mtib/mitm-cache), [`skorotkiewicz/proxy-cache`](https://github.com/skorotkiewicz/proxy-cache) | General MITM caching proxies, but no Actions packaging, no CI-event-driven record/strict modes, no persistence story, and a new binary dependency to vet. |
-| mitmproxy's own [`server_replay`](https://docs.mitmproxy.org/stable/concepts/options/) | Genuinely close, and `server_replay_kill_extra` gives strict mode for free. But the store is **one monolithic flow file**: a cache action re-uploads all of it whenever anything changes, one entry cannot be inspected or pruned, and recording writes at exit, so a killed job loses everything it downloaded. |
-| `vcrpy`, `pytest-recording`, MockServer | Mature, but per-test decoration — metadata in every test file, the shape of the problem being removed — and they cannot cover `curl`/`wget` in example shell scripts at all. |
-| `squid` with SSL-bump | The classic answer, and documented for self-hosted runners. Needs root and a system package, and its cache format is not something a cache action restores usefully. |
+A pull request from a fork gets a read-only token, so it can restore the cache
+but not replace it.
 
-So: the *mechanism* is well-trodden and the engine is off the shelf
-(mitmproxy). What does not exist is the packaging — CI-event-driven modes, a
-per-entry store a cache action can persist incrementally, and the counts a job
-can assert on. That is what this directory is.
+## Options
 
-## Inputs
+All optional.
 
-There are none you need. Every input has a default; see `action.yml` and
-`report/action.yml` for the overrides that exist (`mode`, `hosts`, `port`,
-`cache-key`, and the mitmproxy pin).
+| Input | Default | |
+|---|---|---|
+| `mode` | `record` | `strict` fails a miss with a 504 naming the URL, for showing that a job needs nothing but the cache. `off` starts no proxy. |
+| `cache-key` | `http-cache` | Name of the cache entry. |
+| `port` | `3128` | Proxy port on `127.0.0.1`. |
+| `no-proxy` | *(see above)* | Overrides the built-in deny list. |
+| `mitmproxy-version` | pinned | |
 
-`hosts` deserves a note: it restricts caching to a list you supply, and it is
-there for a caller who wants that deliberately. It was once required, which
-was the wrong default — a list of hosts to cache has to be kept in step with
-the tests by hand, and does nothing at all when a host is forgotten. Deciding
-by exclusion instead means the thing that must be maintained is generic, so
-it lives here.
+`report` takes `assert-used`, to fail if nothing was routed through the proxy,
+and `fail-on-blocked` (default true) for strict mode.
 
-## Locally
+## Running it locally
 
 ```bash
-export HTTP_CACHE_HOSTS=example.org
 eval "$(./http_cache.sh start)"
 # ... run whatever downloads ...
 ./http_cache.sh stop
 ```
 
-The scripts need `mitmproxy` on the path (or `HTTP_CACHE_MITMDUMP` pointing at
-it); the action installs it into a virtual environment of its own.
+`HTTP_CACHE_MODE=strict` with the network removed — `unshare -n`, or
+`docker run --network none` — shows whether a job needs anything it has not
+already cached.
 
-`HTTP_CACHE_MODE=strict` with the network removed (`unshare -n`, or
-`docker run --network none`) is how to prove a test needs nothing but the
-cache.
+## How it works
+
+[mitmproxy](https://mitmproxy.org) does the proxying; `http_cache_proxy.py` is
+the cache. HTTPS is intercepted with a CA generated per run, exported through
+the several variables its clients each read, and appended to the system bundle
+rather than replacing it. Hosts on the deny list are tunnelled without
+interception, so they never see a substituted certificate.
+
+Entries are one directory each, named for the sha256 of the request, holding
+the body and its metadata.

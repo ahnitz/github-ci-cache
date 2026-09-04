@@ -5,17 +5,6 @@ description: >
   changes to the code doing the downloading.
 
 inputs:
-  hosts:
-    description: >
-      Optional.  Restrict caching to these hosts, each optionally followed by
-      a path prefix.  Empty (the default) caches anything that is not on the
-      built-in deny list -- the package registries, the GitHub API and Actions
-      services, and the git smart-HTTP endpoints -- none of which is specific
-      to any project.  Set this only to narrow that deliberately: a list of
-      hosts to cache has to be kept in step with the tests by hand, and does
-      nothing at all when a host is forgotten.
-    required: false
-    default: ''
   mode:
     description: >
       "record" fetches and stores on a miss.  "strict" fails a miss with a 504,
@@ -173,7 +162,6 @@ runs:
       env:
         HTTP_CACHE_MODE: ${{ steps.resolve.outputs.mode }}
         HTTP_CACHE_STATE: ${{ steps.resolve.outputs.state-dir }}
-        HTTP_CACHE_HOSTS: ${{ inputs.hosts }}
         HTTP_CACHE_NO_PROXY: ${{ inputs.no-proxy }}
         HTTP_CACHE_PORT: ${{ inputs.port }}
       run: |
