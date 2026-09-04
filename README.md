@@ -85,6 +85,17 @@ the label cannot affect anyone else's cache.
   are exported. Getting it wrong does not fail cleanly: wget2 with an
   untrusted certificate **hangs** until killed instead of reporting the
   verification failure, which in CI reads as a stuck job.
+- **The proxy picks its own interpreter.** mitmproxy 12 requires Python 3.12,
+  and the job's `python3` belongs to the project's test matrix — on a 3.11 leg
+  the install would fail for a reason that has nothing to do with the project.
+  The action looks for a suitable interpreter itself and runs the proxy in a
+  virtual environment of its own, so the project's environment is untouched.
+- **A proxy that cannot start is fatal only where it has to be.** In strict
+  mode the guarantee is that nothing reaches the network, so there is nothing
+  safe to fall back to and the job fails. In record mode the fall-back is
+  exactly what the job did before this action existed — downloads go straight
+  out — so it warns and carries on rather than inventing a new way for CI to
+  fail.
 - **`no_proxy` excludes three groups**: the package ecosystems (own caches,
   would dominate the budget), the GitHub API (a job's token should not pass
   through a process that terminates TLS), and the Actions cache service
