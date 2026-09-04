@@ -224,6 +224,14 @@ PY
     emit WGETRC              "$WGETRC"
     emit WGET2RC             "$WGETRC"
     emit GIT_SSL_CAINFO      "$CA_BUNDLE"
+    # Node reads neither SSL_CERT_FILE nor any of the above, only this.  It
+    # matters more than it looks: GitHub's own actions are Node programs that
+    # honour http_proxy, so without this they are sent through the proxy and
+    # then cannot verify it -- actions/upload-artifact failed exactly that way,
+    # after the job's real work had already succeeded.  Every host they use
+    # ought to be in no_proxy, but an action meant to reduce fragility should
+    # not depend on that list being exhaustive.
+    emit NODE_EXTRA_CA_CERTS "$CA_BUNDLE"
     emit HTTP_CACHE_STATE    "$STATE"
 }
 

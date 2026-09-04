@@ -30,9 +30,11 @@ changed, and does not know a cache exists.
 
 `http_cache.sh start` launches `mitmdump` on `127.0.0.1` with the addon in
 `http_cache_proxy.py`, then exports the settings that make every client use
-it: `http_proxy`/`https_proxy`, and a CA bundle through the four different
-variables that `urllib`, `requests`, `curl`, `wget` and `git` each read. In
-Actions those go to `$GITHUB_ENV`, so the rest of the job picks them up.
+it: `http_proxy`/`https_proxy`, plus the CA bundle under each of the six names
+its clients read — `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`,
+`WGETRC`, `WGET2RC`, `GIT_SSL_CAINFO` and `NODE_EXTRA_CA_CERTS`. Even that is not enough for every
+client; see the `certifi` note below. In Actions the settings go to
+`$GITHUB_ENV`, so the rest of the job picks them up.
 
 A request to an allow-listed host is answered from disk if it is there. On a
 miss the proxy either fetches and stores it (`record`) or refuses with a 504
@@ -100,6 +102,13 @@ the label cannot affect anyone else's cache.
   exactly what the job did before this action existed — downloads go straight
   out — so it warns and carries on rather than inventing a new way for CI to
   fail.
+- **Node needs its own CA variable, and GitHub's actions are Node programs.**
+  They honour `http_proxy`, so they get sent through the proxy, but they verify
+  TLS against Node's bundled roots and read none of the other CA variables.
+  Without `NODE_EXTRA_CA_CERTS`, `actions/upload-artifact` fails — after the
+  job's real work has already succeeded, which makes it a confusing failure to
+  read. Their hosts should all be in `no_proxy` too, but an action meant to
+  reduce fragility should not rely on that list being exhaustive.
 - **`no_proxy` excludes three groups**: the package ecosystems (own caches,
   would dominate the budget), the GitHub API (a job's token should not pass
   through a process that terminates TLS), and the Actions cache service
