@@ -64,7 +64,7 @@ All optional.
 
 | Input | Default | |
 |---|---|---|
-| `mode` | `record` | `strict` fails a miss with a 504 naming the URL, for showing that a job needs nothing but the cache. `off` starts no proxy. |
+| `mode` | `record` | `strict` refuses a miss with a 504 naming the URL, for showing that a job needs nothing but the cache. `off` starts no proxy. |
 | `cache-key` | `http-cache` | Name of the cache entry. |
 | `port` | `3128` | Proxy port on `127.0.0.1`. |
 | `no-proxy` | *(see above)* | Overrides the built-in deny list. |

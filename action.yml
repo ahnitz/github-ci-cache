@@ -7,20 +7,11 @@ description: >
 inputs:
   mode:
     description: >
-      "record" fetches and stores on a miss.  "strict" fails a miss with a 504,
-      so the job cannot be broken by an upstream outage.  "off" starts no proxy.
-      "auto" (the default) is strict on pull requests and record everywhere
-      else, which keeps pull requests hermetic and lets the default branch and
-      scheduled runs populate the cache.
+      "record" (the default) serves a hit from the cache and fetches, stores
+      and serves a miss.  "strict" refuses a miss with a 504 instead, for
+      showing that a job needs nothing but the cache.  "off" starts no proxy.
     required: false
-    default: 'auto'
-  record-label:
-    description: >
-      Pull request label that switches "auto" from strict to record.  Without
-      an escape hatch a pull request that adds a new download can never pass,
-      because the data it needs only enters the cache once it has merged.
-    required: false
-    default: 'ci-http-cache-record'
+    default: 'record'
   cache-key:
     description: >
       Name of the cache entry, used verbatim.  There is exactly one entry and
@@ -62,7 +53,7 @@ inputs:
 
 outputs:
   mode:
-    description: 'The mode actually used, once "auto" has been resolved.'
+    description: 'The mode in use.'
     value: ${{ steps.resolve.outputs.mode }}
   state-dir:
     description: 'Where the cache and the proxy files ended up.'
@@ -79,28 +70,13 @@ runs:
       shell: bash
       env:
         REQUESTED_MODE: ${{ inputs.mode }}
-        EVENT_NAME: ${{ github.event_name }}
-        HAS_RECORD_LABEL: ${{ contains(github.event.pull_request.labels.*.name, inputs.record-label) }}
         STATE_DIR: ${{ inputs.state-dir }}
         KEY_PREFIX: ${{ inputs.cache-key }}
       run: |
         set -eu
         case "$REQUESTED_MODE" in
-          record|strict|off)
-            mode="$REQUESTED_MODE"
-            ;;
-          auto)
-            if [ "$EVENT_NAME" = "pull_request" ] \
-               && [ "$HAS_RECORD_LABEL" != "true" ]; then
-              mode=strict
-            else
-              mode=record
-            fi
-            ;;
-          *)
-            echo "::error::unknown mode '$REQUESTED_MODE'"
-            exit 1
-            ;;
+          record|strict|off) mode="$REQUESTED_MODE" ;;
+          *) echo "::error::unknown mode '$REQUESTED_MODE'"; exit 1 ;;
         esac
         # Under $HOME, not the runner temp directory: a cache action hashes
         # the path into the cache's identity, so a path that varies by runner
@@ -109,7 +85,7 @@ runs:
         echo "mode=$mode" >> "$GITHUB_OUTPUT"
         echo "state-dir=$state" >> "$GITHUB_OUTPUT"
         echo "cache-key=${KEY_PREFIX}" >> "$GITHUB_OUTPUT"
-        echo "http cache mode: $mode (requested $REQUESTED_MODE, event $EVENT_NAME)"
+        echo "http cache mode: $mode"
 
     # Restore only.  Saving happens in the report action, and only when
     # something new was actually stored, so an unchanged cache is not
