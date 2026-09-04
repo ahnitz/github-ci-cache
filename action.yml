@@ -38,7 +38,11 @@ inputs:
     required: false
     default: 'http-cache'
   state-dir:
-    description: 'Where the cache and the proxy files live.'
+    description: >
+      Where the cache and the proxy files live.  Defaults to
+      ~/.cache/github-ci-cache.  Keep it identical everywhere the cache is
+      restored, saved or refreshed: a cache action hashes the path into the
+      cache's identity.
     required: false
     default: ''
   port:
@@ -80,7 +84,6 @@ runs:
         EVENT_NAME: ${{ github.event_name }}
         HAS_RECORD_LABEL: ${{ contains(github.event.pull_request.labels.*.name, inputs.record-label) }}
         STATE_DIR: ${{ inputs.state-dir }}
-        DEFAULT_STATE_DIR: ${{ runner.temp }}/http-cache
       run: |
         set -eu
         case "$REQUESTED_MODE" in
@@ -100,7 +103,11 @@ runs:
             exit 1
             ;;
         esac
-        state="${STATE_DIR:-$DEFAULT_STATE_DIR}"
+        # Under $HOME rather than the runner temp directory on purpose: a
+        # cache action hashes the path list into the cache's identity, so a
+        # path that varies by runner or OS silently splits one cache into
+        # several and stops a scheduled refresh job from touching the real one.
+        state="${STATE_DIR:-$HOME/.cache/github-ci-cache}"
         echo "mode=$mode" >> "$GITHUB_OUTPUT"
         echo "state-dir=$state" >> "$GITHUB_OUTPUT"
         echo "http cache mode: $mode (requested $REQUESTED_MODE, event $EVENT_NAME)"
