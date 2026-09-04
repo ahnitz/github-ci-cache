@@ -53,6 +53,16 @@ REPLAYED_HEADERS = ('content-type', 'last-modified', 'etag')
 # genuinely hung connection does not eat the job's wall clock.
 UPSTREAM_TIMEOUT = 120
 
+# Retrying belongs here rather than in each client.  The proxy is now the only
+# thing that talks to the origin server, so one retry policy covers every
+# caller -- including a plain curl or wget with no flags of its own.
+UPSTREAM_ATTEMPTS = 4
+UPSTREAM_BACKOFF_CAP = 5
+
+# Status codes where retrying is pointless: the server has said the file is not
+# there, or not ours to have.
+NO_RETRY_STATUS = (400, 401, 403, 404, 410)
+
 
 def _parse_patterns(spec):
     """Parse the allow list into ``(host, path_prefix)`` pairs.
@@ -187,6 +197,30 @@ class HTTPCache:
     # -- upstream --------------------------------------------------------
 
     def _fetch(self, url):
+        """Fetch ``url`` upstream, retrying a transient failure.
+
+        A definitive HTTP error is raised at once, so a genuine "not found" is
+        reported quickly rather than after a minute of back-off.
+        """
+        last_exc = None
+        for attempt in range(1, UPSTREAM_ATTEMPTS + 1):
+            try:
+                return self._fetch_once(url)
+            except urllib.error.HTTPError as exc:
+                if exc.code in NO_RETRY_STATUS:
+                    raise
+                last_exc = exc
+            except Exception as exc:
+                last_exc = exc
+            if attempt < UPSTREAM_ATTEMPTS:
+                logger.warning(
+                    'attempt %d of %d for %s failed (%s), retrying',
+                    attempt, UPSTREAM_ATTEMPTS, url, type(last_exc).__name__
+                )
+                time.sleep(min(UPSTREAM_BACKOFF_CAP, 2 ** attempt))
+        raise last_exc
+
+    def _fetch_once(self, url):
         """Fetch ``url`` upstream, following redirects, and verify the length.
 
         The redirect chain is followed here rather than being handed back to

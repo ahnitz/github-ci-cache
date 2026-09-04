@@ -60,6 +60,10 @@ the label cannot affect anyone else's cache.
   URL that was asked for. GitHub release assets and zenodo files redirect to
   signed URLs that expire, so a cached redirect is a replay that breaks for no
   reason once its token goes stale.
+- **Retrying lives here, not in each client.** The proxy is the only thing
+  that talks to the origin server now, so one policy (4 attempts, capped
+  back-off, no retry on a definitive 4xx) covers every caller — including a
+  plain `curl` or `wget` with no flags of its own.
 - **A body whose length disagrees with `Content-Length` is never cached.** A
   truncated body under a 200 is a real failure mode — Git LFS does it when a
   bandwidth quota is spent — and refusing to store it turns a wrong answer
@@ -108,6 +112,10 @@ clients inside a network namespace with no route off loopback**, where a direct
 fetch was confirmed impossible. `curl`, `wget`, `urllib`, `requests`,
 `astropy.download_file` and `git clone` all worked; the bodies came back
 byte-identical to the recorded ones; a URL that was not in the cache got a 504.
+
+A server that declares 1000 bytes and sends 100 -- the Git LFS quota failure --
+is retried and then reported as a 502, and **nothing is cached**, verified
+against a deliberately lying local server.
 
 ## Why not something off the shelf
 
