@@ -1,0 +1,122 @@
+name: 'Caching HTTP proxy report'
+description: >
+  Stop the caching HTTP proxy, report what it did, and save the cache if this
+  run added anything to it.  Run with "if: always()" so the counts are
+  reported even when the job failed.
+
+inputs:
+  assert-used:
+    description: >
+      Fail if the proxy served no requests at all.  A cache that is never
+      consulted looks exactly like a cache that works, so a job that means to
+      depend on it should assert that it did.
+    required: false
+    default: 'false'
+  state-dir:
+    description: 'Overrides the state directory; defaults to the started one.'
+    required: false
+    default: ''
+  cache-key:
+    description: 'Overrides the cache key prefix; defaults to the started one.'
+    required: false
+    default: ''
+
+outputs:
+  hits:
+    description: 'Requests served from the cache.'
+    value: ${{ steps.stop.outputs.hits }}
+  stored:
+    description: 'Responses newly added to the cache.'
+    value: ${{ steps.stop.outputs.stored }}
+  blocked:
+    description: 'Requests refused because the cache was in strict mode.'
+    value: ${{ steps.stop.outputs.blocked }}
+
+runs:
+  using: composite
+  steps:
+    - name: Stop the proxy and read its counts
+      id: stop
+      shell: bash
+      env:
+        STATE_INPUT: ${{ inputs.state-dir }}
+        KEY_INPUT: ${{ inputs.cache-key }}
+        ASSERT_USED: ${{ inputs.assert-used }}
+      run: |
+        set -eu
+        state="${STATE_INPUT:-${HTTP_CACHE_STATE:-}}"
+        if [ -z "$state" ]; then
+          echo "::notice::no http cache was started, nothing to report"
+          for name in hits stored blocked should-save; do
+            echo "$name=" >> "$GITHUB_OUTPUT"
+          done
+          exit 0
+        fi
+        bash "${HTTP_CACHE_ACTION_PATH:?}/http_cache.sh" stop || true
+
+        stats="$state/stats.json"
+        if [ ! -r "$stats" ]; then
+          echo "::warning::the proxy wrote no stats to $stats"
+          echo "::group::proxy log"
+          tail -50 "$state/mitmdump.log" 2>/dev/null || true
+          echo "::endgroup::"
+          echo "should-save=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        read_stat() {
+          python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], 0))" \
+            "$stats" "$1"
+        }
+        hits="$(read_stat hit)"
+        stored="$(read_stat stored)"
+        blocked="$(read_stat blocked)"
+        errors="$(read_stat error)"
+        forwarded="$(read_stat forwarded)"
+        mode="$(read_stat mode)"
+
+        {
+          echo "hits=$hits"
+          echo "stored=$stored"
+          echo "blocked=$blocked"
+        } >> "$GITHUB_OUTPUT"
+
+        # Saving only when something new was stored keeps an unchanged cache
+        # from being re-uploaded on every run, which matters against a 10 GB
+        # per-repository budget with least-recently-used eviction.
+        if [ "$mode" = "record" ] && [ "$stored" -gt 0 ]; then
+          echo "should-save=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "should-save=false" >> "$GITHUB_OUTPUT"
+        fi
+        key="${KEY_INPUT:-${HTTP_CACHE_KEY:-http-cache}}"
+        echo "cache-key=$key" >> "$GITHUB_OUTPUT"
+        echo "cache-path=$state/cache" >> "$GITHUB_OUTPUT"
+
+        # Every request, by name and disposition.  The counters say how many
+        # went each way; this says which, which is what someone looking at a
+        # cache miss in a CI log actually needs.
+        echo "::group::HTTP cache: every request ($mode mode)"
+        python3 "${{ github.action_path }}/render_summary.py" \
+            "$state/events.jsonl" "$mode" | tee -a "$GITHUB_STEP_SUMMARY"
+        echo "::endgroup::"
+
+        if [ "$blocked" -gt 0 ]; then
+          echo "::error::$blocked request(s) were refused because they are not"\
+               "in the cache. Label this pull request 'ci-http-cache-record'"\
+               "to let it populate the cache, or run the cache-refresh"\
+               "workflow on the default branch."
+        fi
+        if [ "$ASSERT_USED" = "true" ] \
+           && [ "$((hits + stored + blocked + forwarded))" -eq 0 ]; then
+          echo "::error::the http cache proxy served no requests at all, so"\
+               "nothing in this job was routed through it"
+          exit 1
+        fi
+
+    - name: Save the download cache
+      if: steps.stop.outputs.should-save == 'true'
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+      with:
+        key: ${{ steps.stop.outputs.cache-key }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ steps.stop.outputs.cache-path }}

@@ -1,0 +1,154 @@
+name: 'Caching HTTP proxy'
+description: >
+  Start a userspace caching HTTP proxy for the rest of the job, so that data
+  files downloaded by tests come from a cache instead of the network.  Needs no
+  changes to the code doing the downloading.
+
+inputs:
+  hosts:
+    description: >
+      Comma-separated hosts, each optionally followed by a path prefix:
+      "raw.githubusercontent.com" or
+      "github.com/gwastro/pycbc_data/releases/download/".  A subdomain of a
+      listed host matches.  Anything not listed is forwarded untouched -- it
+      still works, it is just neither stored nor, in strict mode, refused.
+      Prefer the narrowest prefix that covers the data: a bare "github.com"
+      also captures the git smart-HTTP endpoints, so strict mode would refuse
+      "pip install git+https://github.com/...".  There is no default, because
+      which URLs are worth caching is a property of the project.
+    required: true
+  mode:
+    description: >
+      "record" fetches and stores on a miss.  "strict" fails a miss with a 504,
+      so the job cannot be broken by an upstream outage.  "off" starts no proxy.
+      "auto" (the default) is strict on pull requests and record everywhere
+      else, which keeps pull requests hermetic and lets the default branch and
+      scheduled runs populate the cache.
+    required: false
+    default: 'auto'
+  record-label:
+    description: >
+      Pull request label that switches "auto" from strict to record.  Without
+      an escape hatch a pull request that adds a new download can never pass,
+      because the data it needs only enters the cache once it has merged.
+    required: false
+    default: 'ci-http-cache-record'
+  cache-key:
+    description: 'Prefix for the cache entry this job restores and saves.'
+    required: false
+    default: 'http-cache'
+  state-dir:
+    description: 'Where the cache and the proxy files live.'
+    required: false
+    default: ''
+  port:
+    description: 'Port the proxy listens on, on 127.0.0.1.'
+    required: false
+    default: '3128'
+  no-proxy:
+    description: >
+      Comma-separated hosts kept off the proxy entirely.  Defaults to the
+      package ecosystems and the GitHub API: they carry their own caches, and
+      keeping them away from a process that terminates TLS keeps a job's token
+      out of it.
+    required: false
+    default: ''
+  mitmproxy-version:
+    description: 'Version of mitmproxy to install. Pinned so runs match.'
+    required: false
+    default: '12.2.3'
+
+outputs:
+  mode:
+    description: 'The mode actually used, once "auto" has been resolved.'
+    value: ${{ steps.resolve.outputs.mode }}
+  state-dir:
+    description: 'Where the cache and the proxy files ended up.'
+    value: ${{ steps.resolve.outputs.state-dir }}
+  cache-hit:
+    description: 'Whether a previous cache was restored for this job.'
+    value: ${{ steps.restore.outputs.cache-matched-key != '' }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve the mode and paths
+      id: resolve
+      shell: bash
+      env:
+        REQUESTED_MODE: ${{ inputs.mode }}
+        EVENT_NAME: ${{ github.event_name }}
+        HAS_RECORD_LABEL: ${{ contains(github.event.pull_request.labels.*.name, inputs.record-label) }}
+        STATE_DIR: ${{ inputs.state-dir }}
+        DEFAULT_STATE_DIR: ${{ runner.temp }}/http-cache
+      run: |
+        set -eu
+        case "$REQUESTED_MODE" in
+          record|strict|off)
+            mode="$REQUESTED_MODE"
+            ;;
+          auto)
+            if [ "$EVENT_NAME" = "pull_request" ] \
+               && [ "$HAS_RECORD_LABEL" != "true" ]; then
+              mode=strict
+            else
+              mode=record
+            fi
+            ;;
+          *)
+            echo "::error::unknown mode '$REQUESTED_MODE'"
+            exit 1
+            ;;
+        esac
+        state="${STATE_DIR:-$DEFAULT_STATE_DIR}"
+        echo "mode=$mode" >> "$GITHUB_OUTPUT"
+        echo "state-dir=$state" >> "$GITHUB_OUTPUT"
+        echo "http cache mode: $mode (requested $REQUESTED_MODE, event $EVENT_NAME)"
+
+    # Restore only.  Saving happens in the report action, and only when
+    # something new was actually stored, so an unchanged cache is not
+    # re-uploaded on every run.
+    - name: Restore the download cache
+      id: restore
+      if: steps.resolve.outputs.mode != 'off'
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+      with:
+        key: ${{ inputs.cache-key }}-
+        restore-keys: ${{ inputs.cache-key }}-
+        path: ${{ steps.resolve.outputs.state-dir }}/cache
+
+    - name: Install mitmproxy
+      if: steps.resolve.outputs.mode != 'off'
+      shell: bash
+      env:
+        STATE: ${{ steps.resolve.outputs.state-dir }}
+        VERSION: ${{ inputs.mitmproxy-version }}
+      run: |
+        set -eu
+        # Its own virtual environment: the proxy is CI scaffolding and must not
+        # perturb the environment the project's own tests run in.
+        python3 -m venv "$STATE/venv"
+        "$STATE/venv/bin/pip" install --quiet --upgrade pip
+        "$STATE/venv/bin/pip" install --quiet "mitmproxy==$VERSION" certifi
+
+    - name: Start the proxy
+      if: steps.resolve.outputs.mode != 'off'
+      shell: bash
+      env:
+        HTTP_CACHE_MODE: ${{ steps.resolve.outputs.mode }}
+        HTTP_CACHE_STATE: ${{ steps.resolve.outputs.state-dir }}
+        HTTP_CACHE_HOSTS: ${{ inputs.hosts }}
+        HTTP_CACHE_NO_PROXY: ${{ inputs.no-proxy }}
+        HTTP_CACHE_PORT: ${{ inputs.port }}
+      run: |
+        set -eu
+        state="${{ steps.resolve.outputs.state-dir }}"
+        export HTTP_CACHE_MITMDUMP="$state/venv/bin/mitmdump"
+        export HTTP_CACHE_SYSTEM_CA="$("$state/venv/bin/python" -c 'import certifi; print(certifi.where())')"
+        # The script appends the client settings to $GITHUB_ENV itself, so the
+        # rest of the job picks them up; stdout is only for local `eval` use.
+        bash "${{ github.action_path }}/http_cache.sh" start > /dev/null
+        # The report action needs these, and reading them from the environment
+        # keeps the caller from having to repeat them.
+        echo "HTTP_CACHE_KEY=${{ inputs.cache-key }}" >> "$GITHUB_ENV"
+        echo "HTTP_CACHE_ACTION_PATH=${{ github.action_path }}" >> "$GITHUB_ENV"
