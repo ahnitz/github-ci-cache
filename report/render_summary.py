@@ -30,6 +30,7 @@ def human(count):
 
 LABELS = {
     'HIT': 'served from the cache',
+    'MISS': 'not cached, fetched from the origin',
     'STORE': 'fetched and added to the cache',
     'BLOCK': 'refused (not cached, strict mode)',
     'FORWARD': 'passed through, not cached',

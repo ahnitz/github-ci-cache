@@ -364,7 +364,14 @@ class HTTPCache:
 
         # A miss in record mode is left to mitmproxy: it fetches and streams
         # from the origin, and responseheaders() copies the body as it passes.
+        #
+        # Logged as an event, because the summary was actively misleading
+        # without it: a job that spent seventy seconds timing out against an
+        # origin reported only "3 passed through, not cached" and said nothing
+        # at all about the five requests that had missed and failed.  A miss is
+        # the most interesting thing in the log when something goes wrong.
         self.stats['miss'] += 1
+        self._log_event('MISS', url, note='not cached, fetching from origin')
 
     def _log_event(self, disposition, url, bytes_=0, elapsed_ms=0, note=''):
         """Append one request to the event log, and say so at INFO.
