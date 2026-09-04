@@ -40,15 +40,11 @@ EVENTS="$STATE/events.jsonl"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ADDON="$HERE/http_cache_proxy.py"
 
-# The deny list.  Nothing here is specific to any project, which is the whole
-# point: it decides what is NOT cached, so a caller lists nothing.  Three
-# groups, for three reasons:
-# the package ecosystems carry their own caches and would dominate the cache
-# budget; the GitHub API is where a job's token goes, and nothing carrying a
-# credential should pass through a process that terminates TLS; and the Actions
-# cache service is how this cache itself is saved and restored, so routing its
-# multi-GB range-request traffic through the proxy would put the proxy in the
-# path of its own persistence.
+# The deny list: not cached, and tunnelled rather than intercepted.  Nothing
+# here is project-specific.  The package registries carry their own caches and
+# would dominate the budget; the GitHub API is where a job's token goes; and
+# the Actions cache service is how this cache is saved and restored, so the
+# proxy must not sit in the path of its own persistence.
 NO_PROXY_HOSTS="${HTTP_CACHE_NO_PROXY:-localhost,127.0.0.1,::1,\
 pypi.org,files.pythonhosted.org,pythonhosted.org,\
 prefix.dev,repo.prefix.dev,conda.anaconda.org,anaconda.org,\
@@ -59,11 +55,9 @@ actions.results.githubusercontent.com}"
 
 log() { printf '%s\n' "$*" >&2; }
 
-# The proxy's own upstream fetches must be direct and must use the real trust
-# store, so every variable this script is about to export is cleared for it.
-# Called as `run_unproxied ... &`: it execs, so that $! is the proxy's own pid
-# rather than a wrapper subshell's.  Killing a wrapper leaves the proxy running,
-# holding the port and never reaching its shutdown hook.
+# Clears every variable this script exports, so the proxy's own connections
+# are direct and use the real trust store.  Called as `run_unproxied ... &`:
+# it execs, so $! is the proxy's pid and not a wrapper subshell's.
 run_unproxied() {
     exec env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
         -u ALL_PROXY -u all_proxy -u no_proxy -u NO_PROXY \
@@ -139,13 +133,9 @@ start() {
     # ignore_hosts matches on host:port, before any request line is read, so
     # it can only key on the host -- a host that appears in the allow list with
     # a path prefix is still intercepted, and the path is applied afterwards.
-    # Tunnel exactly the deny list, and intercept everything else so that it
-    # can be cached.  This is the inverse of the first version, which tunnelled
-    # everything *except* an allow list: that made caching depend on each
-    # project listing its own hosts, which is the metadata this exists to
-    # remove.  What has to be excluded is generic -- package registries, the
-    # GitHub API, the Actions services -- so it ships here and a project
-    # configures nothing.
+    # Tunnel the deny list, intercept everything else so it can be cached.  A
+    # tunnelled connection never sees a substituted certificate, so nothing on
+    # that list has to be taught to trust one.
     local ignore
     ignore=$(python3 - "$NO_PROXY_HOSTS" <<'PY'
 import re, sys
@@ -162,9 +152,9 @@ PY
         return 1
     fi
 
-    # upstream_cert=false is what makes a cache hit need no network at all: by
-    # default mitmproxy fetches the real certificate to mint a lookalike, which
-    # would contact the origin server even when the answer is already on disk.
+    # upstream_cert=false is what makes a hit need no network: by default
+    # mitmproxy fetches the real certificate to mint a lookalike, contacting
+    # the origin even when the answer is already on disk.
     HTTP_CACHE_DIR="$CACHE_DIR" \
     HTTP_CACHE_MODE="$MODE" \
     HTTP_CACHE_STATS="$STATS" \
@@ -194,26 +184,20 @@ PY
         return 1
     fi
 
-    # Our CA is *appended to* the system bundle rather than replacing it, so
-    # that anything deliberately bypassing the proxy keeps its trust roots.
+    # Appended to the system bundle rather than replacing it, so anything
+    # bypassing the proxy keeps its trust roots.
     cat "$(system_ca_bundle)" "$ca" > "$CA_BUNDLE"
-    # wget has no CA environment variable of its own, only a config file -- and
-    # there are two wgets.  GNU wget 1.x reads $WGETRC, wget2 (what Fedora and
-    # some other distributions install as "wget") reads $WGET2RC and ignores
-    # $WGETRC entirely.  Both accept the same ca_certificate key, so one file
-    # serves both.  Getting this wrong does not fail cleanly: wget2 with an
-    # untrusted certificate hangs until it is killed rather than reporting the
-    # verification failure, which in CI reads as a stuck job.
+    # wget has no CA variable, only a config file, and there are two wgets:
+    # GNU wget 1.x reads $WGETRC and wget2 reads $WGET2RC.  Both accept the
+    # same key, so one file serves both.  wget2 with an untrusted certificate
+    # hangs rather than reporting the failure, so this is worth getting right.
     printf 'ca_certificate=%s\n' "$CA_BUNDLE" > "$WGETRC"
 
-    # Some clients ignore every CA environment variable there is.  astropy's
-    # download_file -- which is how a great deal of scientific Python fetches
-    # data -- does `ssl.create_default_context(cafile=certifi.where())`, and
-    # create_default_context with an explicit cafile does not consult
-    # SSL_CERT_FILE at all.  Overriding certifi.where() at interpreter startup
-    # covers every certifi-based client at once without modifying anything in
-    # site-packages.  Caveat: this shadows a sitecustomize of the project's own
-    # if it has one on PYTHONPATH; set HTTP_CACHE_NO_SITECUSTOMIZE=1 to skip.
+    # astropy's download_file passes an explicit cafile to
+    # ssl.create_default_context, which then ignores SSL_CERT_FILE.  Overriding
+    # certifi.where() at interpreter startup reaches every certifi-based client
+    # without touching site-packages.  It does shadow a project's own
+    # sitecustomize; HTTP_CACHE_NO_SITECUSTOMIZE=1 skips it.
     if [ -z "${HTTP_CACHE_NO_SITECUSTOMIZE:-}" ]; then
         mkdir -p "$PYSITE"
         cat > "$PYSITE/sitecustomize.py" <<'PY'
@@ -251,13 +235,9 @@ PY
     emit WGETRC              "$WGETRC"
     emit WGET2RC             "$WGETRC"
     emit GIT_SSL_CAINFO      "$CA_BUNDLE"
-    # Node reads neither SSL_CERT_FILE nor any of the above, only this.  It
-    # matters more than it looks: GitHub's own actions are Node programs that
-    # honour http_proxy, so without this they are sent through the proxy and
-    # then cannot verify it -- actions/upload-artifact failed exactly that way,
-    # after the job's real work had already succeeded.  Every host they use
-    # ought to be in no_proxy, but an action meant to reduce fragility should
-    # not depend on that list being exhaustive.
+    # Node reads none of the above, only this.  GitHub's own actions are Node
+    # programs that honour http_proxy, so they are routed through the proxy
+    # and need to be able to verify it.
     emit NODE_EXTRA_CA_CERTS "$CA_BUNDLE"
     emit HTTP_CACHE_STATE    "$STATE"
 }
@@ -269,8 +249,8 @@ stop() {
     fi
     local pid
     pid="$(cat "$PIDFILE")"
-    # SIGTERM so the proxy shuts down cleanly; the counts are written as it
-    # goes, so they survive even if it has to be killed outright.
+    # SIGTERM for a clean shutdown; the counts are written as it goes, so
+    # they survive a kill.
     kill "$pid" 2>/dev/null || true
     local waited=0
     while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 15 ]; do

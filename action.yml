@@ -113,10 +113,9 @@ runs:
             exit 1
             ;;
         esac
-        # Under $HOME rather than the runner temp directory on purpose: a
-        # cache action hashes the path list into the cache's identity, so a
-        # path that varies by runner or OS silently splits one cache into
-        # several and stops a scheduled refresh job from touching the real one.
+        # Under $HOME, not the runner temp directory: a cache action hashes
+        # the path into the cache's identity, so a path that varies by runner
+        # or OS splits one cache into several.
         state="${STATE_DIR:-$HOME/.cache/github-ci-cache}"
         echo "mode=$mode" >> "$GITHUB_OUTPUT"
         echo "state-dir=$state" >> "$GITHUB_OUTPUT"
@@ -126,12 +125,8 @@ runs:
     # Restore only.  Saving happens in the report action, and only when
     # something new was actually stored, so an unchanged cache is not
     # re-uploaded on every run.
-    # One entry, one constant name: "http-cache" and nothing after it.  A run
-    # id in the key left a new ~300 MB entry behind on every run that stored
-    # anything, against a 10 GB repository limit shared with every other cache
-    # -- which is exactly how that limit got hit.  Exact key, no restore-keys,
-    # so a miss is unambiguous rather than silently landing on some earlier
-    # run's partial copy.
+    # One entry, one constant name, and an exact key with no restore-keys so
+    # that a miss is unambiguous rather than landing on a partial copy.
     - name: Restore the download cache
       id: restore
       if: steps.resolve.outputs.mode != 'off'
@@ -150,11 +145,8 @@ runs:
         MIN_PYTHON: ${{ inputs.minimum-python }}
       run: |
         set -eu
-        # Do NOT use whichever python3 the job happens to have.  The proxy is
-        # CI scaffolding and its interpreter has nothing to do with the version
-        # the project is being tested against -- and mitmproxy 12 requires
-        # 3.12, so a matrix leg on an older python would fail here for no
-        # reason that concerns the project.
+        # Not whichever python3 the job has: mitmproxy needs 3.12, and the
+        # job's interpreter belongs to the project's test matrix.
         found=""
         for candidate in python3.14 python3.13 python3.12 /usr/bin/python3 python3; do
           command -v "$candidate" >/dev/null 2>&1 || continue
@@ -191,12 +183,9 @@ runs:
         export HTTP_CACHE_SYSTEM_CA="$("$state/venv/bin/python" -c 'import certifi; print(certifi.where())')"
         # The script appends the client settings to $GITHUB_ENV itself, so the
         # rest of the job picks them up; stdout is only for local `eval` use.
-        # A proxy that cannot start is fatal only where it has to be.  In
-        # strict mode the guarantee is that nothing reaches the network, so
-        # there is nothing safe to fall back to.  In record mode the fall-back
-        # is exactly the behaviour the job had before this action existed --
-        # downloads go straight out -- so warn and carry on rather than
-        # inventing a new way for CI to fail.
+        # Fatal only in strict mode, where there is nothing safe to fall back
+        # to.  In record mode the fall-back is what the job did before this
+        # action existed, so warn and carry on.
         if [ "${{ steps.install.outputs.started }}" != "true" ] \
            || ! bash "${{ github.action_path }}/http_cache.sh" start > /dev/null; then
           if [ "${{ steps.resolve.outputs.mode }}" = "strict" ]; then

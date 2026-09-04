@@ -34,6 +34,7 @@ LABELS = {
     'STORE': 'fetched and added to the cache',
     'BLOCK': 'refused (not cached, strict mode)',
     'FORWARD': 'passed through, not cached',
+    'SHORT': 'arrived short of its declared length, not cached',
     'ERROR': 'upstream failed',
 }
 by_kind = {}

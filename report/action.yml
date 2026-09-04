@@ -54,15 +54,10 @@ runs:
         FAIL_ON_BLOCKED: ${{ inputs.fail-on-blocked }}
       run: |
         set -eu
-        # Clear the proxy settings BEFORE stopping the proxy.  $GITHUB_ENV
-        # takes effect for later steps, so by the time anything else runs --
-        # this action's own actions/cache/save, or the caller's
-        # upload-artifact -- the variables are gone and it connects directly.
-        # Leaving them set while the proxy is dead is a connection refused to
-        # 127.0.0.1 in a step that has nothing to do with downloading, long
-        # after the job's real work succeeded.  The CA variables can stay:
-        # they name a bundle that is the system one plus our certificate, so
-        # they are harmless without a proxy.
+        # Clear the proxy settings before stopping the proxy: $GITHUB_ENV
+        # applies to later steps, so anything after this connects directly
+        # rather than dialling a listener that is gone.  The CA variables can
+        # stay; they name the system bundle plus our certificate.
         if [ -n "${GITHUB_ENV:-}" ]; then
           for var in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY \
                      no_proxy NO_PROXY; do
@@ -107,9 +102,8 @@ runs:
           echo "blocked=$blocked"
         } >> "$GITHUB_OUTPUT"
 
-        # Saving only when something new was stored keeps an unchanged cache
-        # from being re-uploaded on every run, which matters against a 10 GB
-        # per-repository budget with least-recently-used eviction.
+        # Only when something new was stored, so an unchanged cache is not
+        # re-uploaded every run.
         if [ "$mode" = "record" ] && [ "$stored" -gt 0 ]; then
           echo "should-save=true" >> "$GITHUB_OUTPUT"
         else
@@ -119,9 +113,7 @@ runs:
         echo "cache-key=$key" >> "$GITHUB_OUTPUT"
         echo "cache-path=$state/cache" >> "$GITHUB_OUTPUT"
 
-        # Every request, by name and disposition.  The counters say how many
-        # went each way; this says which, which is what someone looking at a
-        # cache miss in a CI log actually needs.
+        # Every request by name and disposition, not just the counts.
         echo "::group::HTTP cache: every request ($mode mode)"
         python3 "${{ github.action_path }}/render_summary.py" \
             "$state/events.jsonl" "$mode" | tee -a "$GITHUB_STEP_SUMMARY"
@@ -143,11 +135,9 @@ runs:
         fi
         exit "$failed"
 
-    # A cache action cannot overwrite a key, so a constant name can only stay
-    # current if the old entry goes first.  Best effort on purpose: where the
-    # token cannot delete -- a pull request from a fork gets a read-only one --
-    # the save below simply declines and the existing entry is kept, which is
-    # a slower job and not a broken one.
+    # A cache action cannot overwrite a key, so the old entry goes first.
+    # Best effort: where the token cannot delete, the save declines and the
+    # existing entry is kept.
     - name: Make room for the new cache
       if: steps.stop.outputs.should-save == 'true'
       shell: bash
