@@ -58,10 +58,14 @@ the label cannot affect anyone else's cache.
   contacts the origin server even when the answer is already on disk.
 - **The CA bundle is the system bundle with our CA appended**, never our CA
   alone, so anything deliberately bypassing the proxy keeps its trust roots.
-- **The proxy follows redirect chains itself** and stores the result under the
-  URL that was asked for. GitHub release assets and zenodo files redirect to
-  signed URLs that expire, so a cached redirect is a replay that breaks for no
-  reason once its token goes stale.
+- **The response is streamed to the client and copied into the cache as it
+  passes.** This is not an optimisation. The proxy used to fetch each object
+  itself and hand it over complete, so the client got nothing — not even a
+  status line — until the whole download had finished. astropy's
+  `download_file` allows 10 seconds, so every large file failed with a
+  client-side read timeout. Redirects are cached as redirects instead of being
+  collapsed: replaying the same 3xx sends the client to the same target, which
+  is the hop we also stored.
 - **Retrying lives here, not in each client.** The proxy is the only thing
   that talks to the origin server now, so one policy (4 attempts, capped
   back-off, no retry on a definitive 4xx) covers every caller — including a

@@ -22,6 +22,15 @@ strict
 off
     Handled by the launcher, which starts no proxy at all.
 
+The proxy does not fetch upstream itself.  It did once, so that a redirect
+chain could be collapsed and stored under the URL the client asked for -- and
+that meant no byte reached the client until the whole object had been
+downloaded, plus however long the proxy spent retrying.  astropy's
+download_file allows 10 seconds, and pycbc.dq passes timeout=10, so any file
+that took longer than that upstream failed with a client-side read timeout.
+Letting mitmproxy stream from the origin, and storing the body in the response
+hook, is both correct and less code.
+
 Only allow-listed hosts are cached; anything else is forwarded untouched.  The
 package ecosystems (PyPI, conda channels, apt) are kept off the proxy
 altogether by ``no_proxy`` in the launcher -- they carry their own caches, they
@@ -60,21 +69,17 @@ SKIPPED_REQUEST_HEADERS = frozenset({
 # deliberately not Content-Encoding: the stored body is already decoded.
 REPLAYED_HEADERS = ('content-type', 'last-modified', 'etag')
 
-# Long enough for a few hundred MB over a bad link, short enough that a
-# genuinely hung connection does not eat the job's wall clock.  Raised from
-# 120s after a download-heavy job failed: a large file from a slow origin is
-# ordinary, not a hang.
-UPSTREAM_TIMEOUT = 300
+# Statuses worth keeping.  The redirects matter as much as the 200s: a client
+# that follows a chain asks for each hop, so replaying the same 3xx sends it to
+# the same target, which is the hop we also stored.
+CACHEABLE_STATUS = (200, 301, 302, 303, 307, 308)
 
-# Retrying belongs here rather than in each client.  The proxy is now the only
-# thing that talks to the origin server, so one retry policy covers every
-# caller -- including a plain curl or wget with no flags of its own.
-UPSTREAM_ATTEMPTS = 4
-UPSTREAM_BACKOFF_CAP = 5
-
-# Status codes where retrying is pointless: the server has said the file is not
-# there, or not ours to have.
-NO_RETRY_STATUS = (400, 401, 403, 404, 410)
+# Headers not to store or replay: hop-by-hop, or ones describing a connection
+# that no longer exists by the time the entry is replayed.
+SKIPPED_RESPONSE_HEADERS = frozenset({
+    'connection', 'proxy-connection', 'keep-alive', 'te', 'trailer',
+    'transfer-encoding', 'upgrade', 'content-length',
+})
 
 
 def _parse_patterns(spec):
@@ -207,74 +212,75 @@ class HTTPCache:
         os.replace(tmp, entry)
         return meta
 
-    # -- upstream --------------------------------------------------------
-
-    def _fetch(self, url, headers=None):
-        """Fetch ``url`` upstream, retrying a transient failure.
-
-        A definitive HTTP error is raised at once, so a genuine "not found" is
-        reported quickly rather than after a minute of back-off.
-        """
-        last_exc = None
-        for attempt in range(1, UPSTREAM_ATTEMPTS + 1):
-            try:
-                return self._fetch_once(url, headers)
-            except urllib.error.HTTPError as exc:
-                if exc.code in NO_RETRY_STATUS:
-                    raise
-                last_exc = exc
-            except Exception as exc:
-                last_exc = exc
-            if attempt < UPSTREAM_ATTEMPTS:
-                logger.warning(
-                    'attempt %d of %d for %s failed (%s), retrying',
-                    attempt, UPSTREAM_ATTEMPTS, url, type(last_exc).__name__
-                )
-                time.sleep(min(UPSTREAM_BACKOFF_CAP, 2 ** attempt))
-        raise last_exc
-
-    def _fetch_once(self, url, headers=None):
-        """Fetch ``url`` upstream, following redirects, and verify the length.
-
-        The redirect chain is followed here rather than being handed back to
-        the client so that the entry is keyed on the URL the code asked for.
-        GitHub release assets and zenodo files redirect to signed URLs that
-        expire, so a cached redirect is a replay that fails for no reason once
-        its token goes stale.
-        """
-        # Accept-Encoding is dropped so the body we store is the decoded one;
-        # everything else the client sent is passed through unchanged.
-        forwarded = {k: v for k, v in (headers or {}).items()
-                     if k.lower() not in SKIPPED_REQUEST_HEADERS}
-        forwarded.setdefault('User-Agent', 'http-cache-proxy')
-        request = urllib.request.Request(url, headers=forwarded)
-        with urllib.request.urlopen(request, timeout=UPSTREAM_TIMEOUT) as resp:
-            body = resp.read()
-            declared = resp.headers.get('Content-Length')
-            headers = {
-                k.lower(): v for k, v in resp.headers.items()
-                if k.lower() in REPLAYED_HEADERS
-            }
-            final_url = resp.geturl()
-            status = resp.status
-        # A truncated body served with a 200 is a real failure mode -- Git LFS
-        # does it when a bandwidth quota is spent.  Refusing to store it turns
-        # a wrong answer into a retryable error.
-        if declared is not None and len(body) != int(declared):
-            raise IOError(
-                f'{url} returned {len(body)} bytes, declared {declared}'
-            )
-        return status, headers, body, final_url
-
     # -- mitmproxy hooks -------------------------------------------------
 
     async def request(self, flow: http.HTTPFlow):
         try:
             await self._handle(flow)
         finally:
-            # Written after every request rather than only at shutdown, so a
-            # job that is cancelled or killed still reports what it did.
             self._save_stats()
+
+    def responseheaders(self, flow: http.HTTPFlow):
+        """Stream the body to the client while copying it into the cache.
+
+        Streaming is the point.  mitmproxy would otherwise read the whole
+        response before passing it on, so a client waiting on the status line
+        gets nothing until the download finishes -- and astropy allows ten
+        seconds.  A tee gives the client its first byte immediately and still
+        leaves us the complete body to store.
+        """
+        if flow.response is None or getattr(flow, 'from_cache', False):
+            return
+        if not _url_allowed(flow.request.pretty_host, flow.request.path,
+                            self.allowed):
+            return
+        if flow.request.method != 'GET' or 'range' in flow.request.headers:
+            return
+        if flow.response.status_code not in CACHEABLE_STATUS:
+            return
+
+        url = flow.request.pretty_url
+        declared = flow.response.headers.get('content-length')
+        chunks = []
+        started = time.monotonic()
+
+        def tee(chunk):
+            # mitmproxy calls this for each chunk and finally with b'' to
+            # signal the end of the body.
+            if chunk:
+                chunks.append(chunk)
+                return chunk
+            body = b''.join(chunks)
+            self._finish(url, flow, body, declared,
+                         (time.monotonic() - started) * 1000)
+            return chunk
+
+        flow.response.stream = tee
+
+    def _finish(self, url, flow, body, declared, elapsed_ms):
+        """Store a completed response, unless it arrived short."""
+        # A truncated body served with a 200 is a real failure mode -- Git LFS
+        # does it when a bandwidth quota is spent -- so a length that does not
+        # match what was promised is never stored.  The client still gets what
+        # it got; we simply refuse to remember it.
+        if declared is not None and len(body) != int(declared):
+            self.stats['short'] += 1
+            self._log_event(
+                'SHORT', url, len(body), elapsed_ms,
+                note=f'declared {declared}, not cached'
+            )
+            return
+        headers = {k.lower(): v for k, v in flow.response.headers.items()
+                   if k.lower() not in SKIPPED_RESPONSE_HEADERS}
+        self._write(flow.request.method, url, flow.response.status_code,
+                    headers, body, url)
+        self.stats['stored'] += 1
+        self.stats['stored_bytes'] += len(body)
+        note = ''
+        if flow.response.status_code != 200:
+            note = f"HTTP {flow.response.status_code} -> {headers.get('location','')}"
+        self._log_event('STORE', url, len(body), elapsed_ms, note)
+        self._save_stats()
 
     async def _handle(self, flow: http.HTTPFlow):
         url = flow.request.pretty_url
@@ -306,6 +312,8 @@ class HTTPCache:
             flow.response = http.Response.make(
                 meta['status'], body, meta.get('headers', {})
             )
+            # So the response hook does not store what it just served.
+            flow.from_cache = True
             return
 
         if self.mode == 'strict':
@@ -323,51 +331,12 @@ class HTTPCache:
                 ).encode(),
                 {'content-type': 'text/plain'},
             )
+            flow.from_cache = True
             return
 
-        started = time.monotonic()
-        try:
-            status, headers, body, final_url = await asyncio.to_thread(
-                self._fetch, url, dict(flow.request.headers)
-            )
-        except Exception as exc:
-            # Left to the client to retry or fail: the proxy reports what went
-            # wrong rather than deciding how many attempts a caller wanted.
-            self.stats['error'] += 1
-            self._log_event(
-                'ERROR', url, elapsed_ms=(time.monotonic() - started) * 1000,
-                note=f'upstream failed: {type(exc).__name__}: {exc}'
-            )
-            code = getattr(exc, 'code', 502)
-            flow.response = http.Response.make(
-                code,
-                f'http cache: fetching {url} failed: '
-                f'{type(exc).__name__}: {exc}\n'.encode(),
-                {'content-type': 'text/plain'},
-            )
-            return
-
-        elapsed_ms = (time.monotonic() - started) * 1000
-        if status == 200:
-            self._write(method, url, status, headers, body, final_url)
-            self.stats['stored'] += 1
-            self.stats['stored_bytes'] += len(body)
-            note = ''
-            if final_url != url:
-                # Worth saying, because it means the redirect chain was
-                # collapsed and the entry is keyed on the URL asked for rather
-                # than on a target that will expire.  The query string is
-                # dropped: on a release asset it is a several-hundred-character
-                # signature and a JWT, which is both noise and a credential,
-                # short-lived or not.
-                parts = urllib.parse.urlsplit(final_url)
-                note = f'via {parts.scheme}://{parts.netloc}{parts.path}'
-            self._log_event('STORE', url, len(body), elapsed_ms, note)
-        else:
-            self.stats['not_stored'] += 1
-            self._log_event('FORWARD', url, len(body), elapsed_ms,
-                            note=f'HTTP {status}, not stored')
-        flow.response = http.Response.make(status, body, headers)
+        # A miss in record mode is left to mitmproxy: it fetches and streams
+        # from the origin, and responseheaders() copies the body as it passes.
+        self.stats['miss'] += 1
 
     def _log_event(self, disposition, url, bytes_=0, elapsed_ms=0, note=''):
         """Append one request to the event log, and say so at INFO.
