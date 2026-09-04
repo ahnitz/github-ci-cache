@@ -34,7 +34,9 @@ inputs:
     required: false
     default: 'ci-http-cache-record'
   cache-key:
-    description: 'Prefix for the cache entry this job restores and saves.'
+    description: >
+      Name of the cache entry, used verbatim.  There is exactly one entry and
+      nothing is appended to this, so the cache cannot accumulate versions.
     required: false
     default: 'http-cache'
   state-dir:
@@ -92,6 +94,7 @@ runs:
         EVENT_NAME: ${{ github.event_name }}
         HAS_RECORD_LABEL: ${{ contains(github.event.pull_request.labels.*.name, inputs.record-label) }}
         STATE_DIR: ${{ inputs.state-dir }}
+        KEY_PREFIX: ${{ inputs.cache-key }}
       run: |
         set -eu
         case "$REQUESTED_MODE" in
@@ -118,18 +121,24 @@ runs:
         state="${STATE_DIR:-$HOME/.cache/github-ci-cache}"
         echo "mode=$mode" >> "$GITHUB_OUTPUT"
         echo "state-dir=$state" >> "$GITHUB_OUTPUT"
+        echo "cache-key=${KEY_PREFIX}" >> "$GITHUB_OUTPUT"
         echo "http cache mode: $mode (requested $REQUESTED_MODE, event $EVENT_NAME)"
 
     # Restore only.  Saving happens in the report action, and only when
     # something new was actually stored, so an unchanged cache is not
     # re-uploaded on every run.
+    # One entry, one constant name: "http-cache" and nothing after it.  A run
+    # id in the key left a new ~300 MB entry behind on every run that stored
+    # anything, against a 10 GB repository limit shared with every other cache
+    # -- which is exactly how that limit got hit.  Exact key, no restore-keys,
+    # so a miss is unambiguous rather than silently landing on some earlier
+    # run's partial copy.
     - name: Restore the download cache
       id: restore
       if: steps.resolve.outputs.mode != 'off'
       uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
       with:
-        key: ${{ inputs.cache-key }}-
-        restore-keys: ${{ inputs.cache-key }}-
+        key: ${{ steps.resolve.outputs.cache-key }}
         path: ${{ steps.resolve.outputs.state-dir }}/cache
 
     - name: Install mitmproxy
@@ -202,5 +211,5 @@ runs:
         fi
         # The report action needs these, and reading them from the environment
         # keeps the caller from having to repeat them.
-        echo "HTTP_CACHE_KEY=${{ inputs.cache-key }}" >> "$GITHUB_ENV"
+        echo "HTTP_CACHE_KEY=${{ steps.resolve.outputs.cache-key }}" >> "$GITHUB_ENV"
         echo "HTTP_CACHE_ACTION_PATH=${{ github.action_path }}" >> "$GITHUB_ENV"

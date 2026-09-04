@@ -143,9 +143,32 @@ runs:
         fi
         exit "$failed"
 
+    # A cache action cannot overwrite a key, so a constant name can only stay
+    # current if the old entry goes first.  Best effort on purpose: where the
+    # token cannot delete -- a pull request from a fork gets a read-only one --
+    # the save below simply declines and the existing entry is kept, which is
+    # a slower job and not a broken one.
+    - name: Make room for the new cache
+      if: steps.stop.outputs.should-save == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        KEY: ${{ steps.stop.outputs.cache-key }}
+      run: |
+        set -u
+        if gh api --method DELETE \
+             "/repos/${GITHUB_REPOSITORY}/actions/caches?key=${KEY}" \
+             >/dev/null 2>&1; then
+          echo "replaced the previous ${KEY} entry"
+        else
+          echo "::notice::could not delete the existing ${KEY} cache entry"\
+               "(a read-only token, or nothing there yet); if one exists it"\
+               "will be kept and this run's additions will not be saved"
+        fi
+
     - name: Save the download cache
       if: steps.stop.outputs.should-save == 'true'
       uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
       with:
-        key: ${{ steps.stop.outputs.cache-key }}-${{ github.run_id }}-${{ github.run_attempt }}
+        key: ${{ steps.stop.outputs.cache-key }}
         path: ${{ steps.stop.outputs.cache-path }}
