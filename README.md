@@ -60,9 +60,11 @@ so a file fetched on macOS is the same file on Linux. The cache lives at a
 fixed path for that reason -- a path built from `$HOME` differs between the
 two and would silently give each its own copy.
 
-A pull request from a fork gets a read-only token, so it can restore the cache
-but not replace it. Those runs say so once and skip the save; the cache is
-written by runs on the default branch.
+A pull request from a fork can restore the cache and can create one, but not
+replace an existing one: deleting goes through the REST API on `GITHUB_TOKEN`,
+which is read-only there, while saving goes through the cache service on its
+own token. Such a run reports the failed delete and still attempts the save,
+which succeeds whenever no entry exists for the key.
 
 ## Options
 

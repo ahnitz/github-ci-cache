@@ -136,11 +136,14 @@ runs:
         exit "$failed"
 
     # A cache action cannot overwrite a key, so the old entry goes first.
-    # A token that cannot delete also cannot save, so decide here and let the
-    # save step skip rather than fail: a pull request from a fork always gets
-    # a read-only token, and a failed save there is policy, not a fault.
+    # Deleting and saving use different credentials -- the REST API below
+    # takes GITHUB_TOKEN, which needs actions:write and is read-only on a
+    # fork's pull request, while the save takes ACTIONS_RUNTIME_TOKEN, which
+    # every job has.  So a delete that fails means "cannot replace", never
+    # "cannot save": the save still creates the entry when none exists for
+    # this key, which is how a cache first appears and how it recovers after
+    # the path changes.  The save runs unconditionally for that reason.
     - name: Make room for the new cache
-      id: room
       if: steps.stop.outputs.should-save == 'true'
       shell: bash
       env:
@@ -152,22 +155,18 @@ runs:
                     "/repos/${GITHUB_REPOSITORY}/actions/caches?key=${KEY}" \
                     2>&1 >/dev/null)"; then
           echo "replaced the previous ${KEY} entry"
-          echo "writable=true" >> "$GITHUB_OUTPUT"
         elif printf '%s' "$err" | grep -qiE 'HTTP 404|not found'; then
-          # Nothing to replace, which is the normal first run.
-          echo "no existing ${KEY} entry"
-          echo "writable=true" >> "$GITHUB_OUTPUT"
+          echo "no existing ${KEY} entry to replace"
         else
-          echo "::notice::this job's Actions token is read-only, so the"\
-               "${KEY} entry cannot be replaced and what this job downloaded"\
-               "is not kept. Expected on a pull request from a fork; the"\
-               "cache is written by runs on the default branch."
-          echo "writable=false" >> "$GITHUB_OUTPUT"
+          echo "::notice::could not delete the existing ${KEY} entry, so an"\
+               "entry already there will be kept and the save below will"\
+               "report a conflict. Expected where GITHUB_TOKEN is read-only,"\
+               "as on a pull request from a fork. A save still succeeds when"\
+               "no entry exists for this key."
         fi
 
     - name: Save the download cache
       if: steps.stop.outputs.should-save == 'true'
-        && steps.room.outputs.writable == 'true'
       uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
       with:
         key: ${{ steps.stop.outputs.cache-key }}
