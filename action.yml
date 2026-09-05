@@ -78,10 +78,12 @@ runs:
           record|strict|off) mode="$REQUESTED_MODE" ;;
           *) echo "::error::unknown mode '$REQUESTED_MODE'"; exit 1 ;;
         esac
-        # Under $HOME, not the runner temp directory: a cache action hashes
-        # the path into the cache's identity, so a path that varies by runner
-        # or OS splits one cache into several.
-        state="${STATE_DIR:-$HOME/.cache/github-ci-cache}"
+        # A literal path, not one built from $HOME or $RUNNER_TEMP.  A cache
+        # action derives the entry's identity from the path, so a path that
+        # differs between runners splits one cache into several -- $HOME is
+        # /home/runner on Linux and /Users/runner on macOS, which is enough to
+        # give each platform its own copy of identical data files.
+        state="${STATE_DIR:-/tmp/github-ci-cache}"
         echo "mode=$mode" >> "$GITHUB_OUTPUT"
         echo "state-dir=$state" >> "$GITHUB_OUTPUT"
         echo "cache-key=${KEY_PREFIX}" >> "$GITHUB_OUTPUT"

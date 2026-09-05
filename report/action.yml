@@ -136,9 +136,11 @@ runs:
         exit "$failed"
 
     # A cache action cannot overwrite a key, so the old entry goes first.
-    # Best effort: where the token cannot delete, the save declines and the
-    # existing entry is kept.
+    # A token that cannot delete also cannot save, so decide here and let the
+    # save step skip rather than fail: a pull request from a fork always gets
+    # a read-only token, and a failed save there is policy, not a fault.
     - name: Make room for the new cache
+      id: room
       if: steps.stop.outputs.should-save == 'true'
       shell: bash
       env:
@@ -146,18 +148,26 @@ runs:
         KEY: ${{ steps.stop.outputs.cache-key }}
       run: |
         set -u
-        if gh api --method DELETE \
-             "/repos/${GITHUB_REPOSITORY}/actions/caches?key=${KEY}" \
-             >/dev/null 2>&1; then
+        if err="$(gh api --method DELETE \
+                    "/repos/${GITHUB_REPOSITORY}/actions/caches?key=${KEY}" \
+                    2>&1 >/dev/null)"; then
           echo "replaced the previous ${KEY} entry"
+          echo "writable=true" >> "$GITHUB_OUTPUT"
+        elif printf '%s' "$err" | grep -qiE 'HTTP 404|not found'; then
+          # Nothing to replace, which is the normal first run.
+          echo "no existing ${KEY} entry"
+          echo "writable=true" >> "$GITHUB_OUTPUT"
         else
-          echo "::notice::could not delete the existing ${KEY} cache entry"\
-               "(a read-only token, or nothing there yet); if one exists it"\
-               "will be kept and this run's additions will not be saved"
+          echo "::notice::this job's Actions token is read-only, so the"\
+               "${KEY} entry cannot be replaced and what this job downloaded"\
+               "is not kept. Expected on a pull request from a fork; the"\
+               "cache is written by runs on the default branch."
+          echo "writable=false" >> "$GITHUB_OUTPUT"
         fi
 
     - name: Save the download cache
       if: steps.stop.outputs.should-save == 'true'
+        && steps.room.outputs.writable == 'true'
       uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
       with:
         key: ${{ steps.stop.outputs.cache-key }}

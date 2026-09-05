@@ -55,8 +55,14 @@ One Actions cache entry called `http-cache`, replaced each time something new
 is stored. Deleting it from the repository's cache page is safe; the next run
 fills it again.
 
+One entry for every platform, not one per platform: these are HTTP responses,
+so a file fetched on macOS is the same file on Linux. The cache lives at a
+fixed path for that reason -- a path built from `$HOME` differs between the
+two and would silently give each its own copy.
+
 A pull request from a fork gets a read-only token, so it can restore the cache
-but not replace it.
+but not replace it. Those runs say so once and skip the save; the cache is
+written by runs on the default branch.
 
 ## Options
 
