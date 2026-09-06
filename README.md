@@ -70,6 +70,23 @@ so a file fetched on macOS is the same file on Linux. The cache lives at a
 fixed path for that reason -- a path built from `$HOME` differs between the
 two and would silently give each its own copy.
 
+A pull request never writes the cache unless its branch lives in the
+repository itself. It still reads one: a run restores entries scoped to its
+own ref and to its base branch, and reading was never restricted. So the
+default branch is the writer -- on its own pushes, and on the schedule in the
+refresh workflow -- and every pull request reads what it leaves.
+
+A pull request from another repository could create an entry, but the entry
+would be scoped to `refs/pull/N/merge`, readable by that one pull request and
+nothing else, holding whatever the job that made it happened to download, with
+no way to improve it afterwards. Such a run skips the upload, and the delete,
+and folding the cache in, and says so in its one notice.
+
+One consequence worth knowing: an entry in a pull request's own scope shadows
+the default branch's, and restoring it every run keeps resetting its seven-day
+eviction timer. A pull request that cached something before this rule existed
+will keep reading that copy until the entry is deleted by hand.
+
 Who can write it follows from the two credentials involved. Deleting an entry
 goes through the REST API on `GITHUB_TOKEN`, which needs `actions: write` and
 is read-only on a pull request from a fork; uploading goes through the cache

@@ -52,6 +52,10 @@ runs:
         KEY_INPUT: ${{ inputs.cache-key }}
         ASSERT_USED: ${{ inputs.assert-used }}
         FAIL_ON_BLOCKED: ${{ inputs.fail-on-blocked }}
+        FOREIGN_PR: >-
+          ${{ github.event_name == 'pull_request'
+              && github.event.pull_request.head.repo.full_name
+                 != github.repository }}
       run: |
         set -eu
         # Clear the proxy settings before stopping the proxy: $GITHUB_ENV
@@ -102,12 +106,35 @@ runs:
           echo "blocked=$blocked"
         } >> "$GITHUB_OUTPUT"
 
-        # Only when something new was stored, so an unchanged cache is not
-        # re-uploaded every run.
-        if [ "$mode" = "record" ] && [ "$stored" -gt 0 ]; then
-          echo "should-save=true" >> "$GITHUB_OUTPUT"
-        else
+        # Three reasons not to upload, checked before the work of folding
+        # the cache in and deleting the entry, so a job that will not upload
+        # does none of it.
+        #
+        # A pull request from another repository is the one worth spelling
+        # out.  It cannot replace an entry -- deleting one needs actions:write
+        # on GITHUB_TOKEN, which GitHub makes read-only there -- but it can
+        # create one, because uploading goes through the cache service on
+        # ACTIONS_RUNTIME_TOKEN, which every job has.  That is not worth
+        # doing: the entry it creates is scoped to refs/pull/N/merge, so no
+        # other pull request and not the default branch can read it, it holds
+        # whatever that one job happened to download, and nothing can ever
+        # improve it.  The default branch is the writer, on its own pushes and
+        # on the schedule in the refresh workflow, and every pull request
+        # reads what it leaves.
+        reason=''
+        if [ "$mode" != "record" ]; then
+          reason="no upload, mode is $mode"
+        elif [ "$FOREIGN_PR" = "true" ]; then
+          reason="no upload, a pull request from another repository cannot"
+          reason="$reason replace the entry and the one it could create is"
+          reason="$reason readable only by itself"
+        elif [ "$stored" -eq 0 ]; then
+          reason="no upload, everything asked for was already cached"
+        fi
+        if [ -n "$reason" ]; then
           echo "should-save=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "should-save=true" >> "$GITHUB_OUTPUT"
         fi
         key="${KEY_INPUT:-${HTTP_CACHE_KEY:-http-cache}}"
         echo "cache-key=$key" >> "$GITHUB_OUTPUT"
@@ -117,7 +144,8 @@ runs:
         # token: the step summary and the log need one, so this is the only
         # place the hit rate can be compared across runs from outside.
         echo "::notice::http cache ($mode): $hits hit, $stored stored,"\
-             "$forwarded forwarded, $blocked blocked, $errors error"
+             "$forwarded forwarded, $blocked blocked, $errors error;"\
+             "${reason:-uploading}"
 
         # Every request by name and disposition, not just the counts.
         echo "::group::HTTP cache: every request ($mode mode)"
