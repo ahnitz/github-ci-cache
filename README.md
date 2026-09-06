@@ -51,9 +51,19 @@ were served without touching the network.
 
 ## The cache itself
 
-One Actions cache entry called `http-cache`, replaced each time something new
-is stored. Deleting it from the repository's cache page is safe; the next run
-fills it again.
+One Actions cache entry called `http-cache`, replaced whenever a job stored
+something new. A job that hit the cache for everything it asked for uploads
+nothing. Deleting the entry from the repository's cache page is safe; the next
+run fills it again.
+
+Every job in a run shares that one key, so each upload has to carry the other
+jobs' work as well as its own. Before uploading, a job restores the key again
+and unpacks it over what it already has, making the upload a superset of the
+entry it replaces. Without that step the uploads are last-writer-wins and the
+cache only ever gains the downloads of whichever job finished last. The race
+is narrowed, not closed: a job that uploads in the seconds between another
+job's restore and its upload loses its downloads until the next run, and the
+cache API offers no compare-and-swap to do better.
 
 One entry for every platform, not one per platform: these are HTTP responses,
 so a file fetched on macOS is the same file on Linux. The cache lives at a

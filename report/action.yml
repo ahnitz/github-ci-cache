@@ -141,6 +141,34 @@ runs:
         fi
         exit "$failed"
 
+    # Fold in whatever the cache gained while this job was running, so the
+    # upload below is a superset of the entry it replaces instead of a
+    # substitute for it.  Without this the saves are last-writer-wins: each
+    # job uploads the cache it restored at the start plus its own downloads,
+    # so whichever job finishes last discards every other job's contribution
+    # and the cache grows by one job per run.
+    #
+    # The restore has to name the same path as the save.  A cache action
+    # derives an entry's identity from the sha256 of its path list, so a
+    # restore into a scratch directory would look for an entry that does not
+    # exist and miss every time.  Unpacking over our own state directory is
+    # safe because the store is content addressed -- one directory per sha256
+    # of the method and URL, holding a body and its metadata, with no index --
+    # so an entry both copies hold is overwritten with itself and entries
+    # only one holds sit side by side.
+    #
+    # This narrows the race rather than closing it: a job that saves between
+    # this restore and the upload below still loses its downloads, and the
+    # next run collects them again.  The cache API has no compare-and-swap,
+    # so rarer is the best available.
+    - name: Fold in what the cache gained while this job ran
+      if: steps.stop.outputs.should-save == 'true'
+      continue-on-error: true
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+      with:
+        key: ${{ steps.stop.outputs.cache-key }}
+        path: ${{ steps.stop.outputs.cache-path }}
+
     # A cache action cannot overwrite a key, so the old entry goes first.
     # Deleting and saving use different credentials -- the REST API below
     # takes GITHUB_TOKEN, which needs actions:write and is read-only on a
