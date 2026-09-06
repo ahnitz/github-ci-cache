@@ -206,6 +206,14 @@ runs:
     # instead would mean reimplementing that version hash, and would see the
     # entries left at other paths as collisions when they are not.
     #
+    # Only "true" means in the way.  A restore that found nothing leaves
+    # cache-hit empty rather than false, so testing for false tests nothing --
+    # and a restore can also fail outright, which is not a miss: another job
+    # deleting the entry mid-download gives "the specified blob does not
+    # exist".  Its outcome tells the two apart, and where the restore failed
+    # the upload goes ahead, since a conflict costs a warning while a skipped
+    # upload can cost the cache its only chance to exist.
+    #
     # Deleting and saving use different credentials.  The REST API below takes
     # GITHUB_TOKEN, which needs actions:write and is read-only on a pull
     # request from a fork; the save takes ACTIONS_RUNTIME_TOKEN, which every
@@ -228,10 +236,11 @@ runs:
         GH_TOKEN: ${{ github.token }}
         KEY: ${{ steps.stop.outputs.cache-key }}
         IN_THE_WAY: ${{ steps.fold.outputs.cache-hit }}
+        FOLD_RAN: ${{ steps.fold.outcome }}
       run: |
         set -u
-        if [ "$IN_THE_WAY" = "false" ]; then
-          echo "no ${KEY} entry to replace, so the upload creates it"
+        if [ "$FOLD_RAN" = "success" ] && [ "$IN_THE_WAY" != "true" ]; then
+          echo "nothing named ${KEY} is in the way, so the upload creates it"
           echo "upload=true" >> "$GITHUB_OUTPUT"
           exit 0
         fi
@@ -240,13 +249,14 @@ runs:
                     2>&1 >/dev/null)"; then
           echo "replaced the previous ${KEY} entry"
           echo "upload=true" >> "$GITHUB_OUTPUT"
-        elif [ -z "$IN_THE_WAY" ]; then
-          # The restore did not report, so whether an entry is in the way is
-          # unknown.  Upload anyway: a conflict costs a warning, while not
-          # uploading can cost the cache its only chance to be created.
-          echo "::notice::could not delete the existing ${KEY} entry and"\
-               "cannot tell whether one is in the way, so the upload below"\
-               "runs and may report a conflict"
+        elif printf '%s' "$err" | grep -qiE 'HTTP 404|not found'; then
+          echo "the ${KEY} entry went away before it could be deleted"
+          echo "upload=true" >> "$GITHUB_OUTPUT"
+        elif [ "$FOLD_RAN" != "success" ]; then
+          echo "::notice::could not delete the ${KEY} entry, and the restore"\
+               "that would say whether one is in the way did not finish, so"\
+               "the upload runs and may report a conflict. Delete says:"\
+               "${err}"
           echo "upload=true" >> "$GITHUB_OUTPUT"
         else
           echo "::notice::keeping the existing ${KEY} entry and skipping the"\
