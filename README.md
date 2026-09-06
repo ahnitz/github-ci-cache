@@ -70,11 +70,22 @@ so a file fetched on macOS is the same file on Linux. The cache lives at a
 fixed path for that reason -- a path built from `$HOME` differs between the
 two and would silently give each its own copy.
 
-A pull request from a fork can restore the cache and can create one, but not
-replace an existing one: deleting goes through the REST API on `GITHUB_TOKEN`,
-which is read-only there, while saving goes through the cache service on its
-own token. Such a run reports the failed delete and still attempts the save,
-which succeeds whenever no entry exists for the key.
+Who can write it follows from the two credentials involved. Deleting an entry
+goes through the REST API on `GITHUB_TOKEN`, which needs `actions: write` and
+is read-only on a pull request from a fork; uploading goes through the cache
+service on `ACTIONS_RUNTIME_TOKEN`, which every job has. So:
+
+- Nothing in the way: upload, no delete. This is how the cache first appears,
+  and it works even on a fork's pull request.
+- An entry in the way and deletable: delete, then upload over it.
+- An entry in the way and not deletable: keep it and skip the upload, which
+  could only conflict. A run would otherwise report one conflict warning per
+  job. A pull request on a branch of the repository itself lands here only if
+  the repository withholds `actions: write` from workflows.
+
+"In the way" comes from the restore, not from asking the API: a restore hits
+only for an entry whose key and version both match what an upload would use,
+and the version is a hash of the path that a caller cannot compute for itself.
 
 ## Options
 

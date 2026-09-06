@@ -162,6 +162,7 @@ runs:
     # next run collects them again.  The cache API has no compare-and-swap,
     # so rarer is the best available.
     - name: Fold in what the cache gained while this job ran
+      id: fold
       if: steps.stop.outputs.should-save == 'true'
       continue-on-error: true
       uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
@@ -169,38 +170,66 @@ runs:
         key: ${{ steps.stop.outputs.cache-key }}
         path: ${{ steps.stop.outputs.cache-path }}
 
-    # A cache action cannot overwrite a key, so the old entry goes first.
-    # Deleting and saving use different credentials -- the REST API below
-    # takes GITHUB_TOKEN, which needs actions:write and is read-only on a
-    # fork's pull request, while the save takes ACTIONS_RUNTIME_TOKEN, which
-    # every job has.  So a delete that fails means "cannot replace", never
-    # "cannot save": the save still creates the entry when none exists for
-    # this key, which is how a cache first appears and how it recovers after
-    # the path changes.  The save runs unconditionally for that reason.
+    # A cache action cannot overwrite a key, so an entry that is in the way
+    # has to be deleted first -- and only then.  Whether one is in the way is
+    # exactly what the restore above reports: its cache-hit is true only for
+    # an entry matching this key AND the version that a save would compute
+    # from the path, which is the pair that collides.  Asking the REST API
+    # instead would mean reimplementing that version hash, and would see the
+    # entries left at other paths as collisions when they are not.
+    #
+    # Deleting and saving use different credentials.  The REST API below takes
+    # GITHUB_TOKEN, which needs actions:write and is read-only on a pull
+    # request from a fork; the save takes ACTIONS_RUNTIME_TOKEN, which every
+    # job has.  So the three cases are distinct:
+    #
+    #   nothing in the way   -> upload, no delete.  This is how a cache first
+    #                           appears, and it works on a fork's pull request
+    #                           even though nothing there can replace an entry.
+    #   in the way, deleted  -> upload, which now replaces it.
+    #   in the way, kept     -> skip the upload.  It could only conflict, and
+    #                           a run has as many of those warnings as it has
+    #                           jobs.  A pull request on a branch of the
+    #                           repository itself lands here only if the
+    #                           repository withholds actions:write.
     - name: Make room for the new cache
+      id: room
       if: steps.stop.outputs.should-save == 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
         KEY: ${{ steps.stop.outputs.cache-key }}
+        IN_THE_WAY: ${{ steps.fold.outputs.cache-hit }}
       run: |
         set -u
+        if [ "$IN_THE_WAY" = "false" ]; then
+          echo "no ${KEY} entry to replace, so the upload creates it"
+          echo "upload=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
         if err="$(gh api --method DELETE \
                     "/repos/${GITHUB_REPOSITORY}/actions/caches?key=${KEY}" \
                     2>&1 >/dev/null)"; then
           echo "replaced the previous ${KEY} entry"
-        elif printf '%s' "$err" | grep -qiE 'HTTP 404|not found'; then
-          echo "no existing ${KEY} entry to replace"
+          echo "upload=true" >> "$GITHUB_OUTPUT"
+        elif [ -z "$IN_THE_WAY" ]; then
+          # The restore did not report, so whether an entry is in the way is
+          # unknown.  Upload anyway: a conflict costs a warning, while not
+          # uploading can cost the cache its only chance to be created.
+          echo "::notice::could not delete the existing ${KEY} entry and"\
+               "cannot tell whether one is in the way, so the upload below"\
+               "runs and may report a conflict"
+          echo "upload=true" >> "$GITHUB_OUTPUT"
         else
-          echo "::notice::could not delete the existing ${KEY} entry, so an"\
-               "entry already there will be kept and the save below will"\
-               "report a conflict. Expected where GITHUB_TOKEN is read-only,"\
-               "as on a pull request from a fork. A save still succeeds when"\
-               "no entry exists for this key."
+          echo "::notice::keeping the existing ${KEY} entry and skipping the"\
+               "upload, which could only conflict with it. GITHUB_TOKEN needs"\
+               "actions:write to replace an entry and is read-only on a pull"\
+               "request from a fork. Delete says: ${err}"
+          echo "upload=false" >> "$GITHUB_OUTPUT"
         fi
 
     - name: Save the download cache
-      if: steps.stop.outputs.should-save == 'true'
+      if: steps.room.outputs.upload == 'true'
       uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
       with:
         key: ${{ steps.stop.outputs.cache-key }}
