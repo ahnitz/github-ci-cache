@@ -113,6 +113,12 @@ runs:
         echo "cache-key=$key" >> "$GITHUB_OUTPUT"
         echo "cache-path=$state/cache" >> "$GITHUB_OUTPUT"
 
+        # A one-line count in the run's annotations, which read without a
+        # token: the step summary and the log need one, so this is the only
+        # place the hit rate can be compared across runs from outside.
+        echo "::notice::http cache ($mode): $hits hit, $stored stored,"\
+             "$forwarded forwarded, $blocked blocked, $errors error"
+
         # Every request by name and disposition, not just the counts.
         echo "::group::HTTP cache: every request ($mode mode)"
         python3 "${{ github.action_path }}/render_summary.py" \
