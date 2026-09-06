@@ -128,6 +128,11 @@ runs:
           reason="no upload, a pull request from another repository cannot"
           reason="$reason replace the entry and the one it could create is"
           reason="$reason readable only by itself"
+        elif [ "$((hits + stored + forwarded + blocked))" -eq 0 ]; then
+          # Distinct from an all-hit job, and the more interesting of the
+          # two: nothing in this job was routed through the proxy at all,
+          # which is what a client that ignores http_proxy looks like.
+          reason="no upload, nothing was requested through the proxy"
         elif [ "$stored" -eq 0 ]; then
           reason="no upload, everything asked for was already cached"
         fi
